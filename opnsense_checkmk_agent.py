@@ -32,7 +32,7 @@
 ##
 
 
-__VERSION__ = "1.2.17"
+__VERSION__ = "1.2.18"
 
 import sys
 import os
@@ -958,6 +958,34 @@ class checkmk_checker(object):
                 return arguments
         raise ValueError("Kea response too large")
 
+    @staticmethod
+    def _kea_pool_usage(statistics, subnet, total_kind, assigned_kind):
+        """Aggregate pool counters, never mix subnet leases with pool capacity.
+
+        Reservations outside dynamic ranges appear only in subnet counters.
+        Pools sharing an ID also share counters (the default ID is zero), so
+        each ID must be counted once. PD pools have a separate counter namespace.
+        """
+        sid = int(subnet["id"])
+        is_pd = total_kind == "pds"
+        pools = subnet["pd-pools" if is_pd else "pools"]
+        pool_ids = {int(pool.get("pool-id", 0)) for pool in pools}
+        total = assigned = declined = 0
+        for pid in pool_ids:
+            prefix = "subnet[{0}].{1}[{2}].".format(sid, "pd-pool" if is_pd else "pool", pid)
+            pool_total = int(statistics[prefix + "total-" + total_kind][0][0])
+            pool_assigned = int(statistics[prefix + assigned_kind][0][0])
+            pool_declined = int(statistics.get(prefix + "declined-addresses", [[0]])[0][0]) if not is_pd else 0
+            if pool_total <= 0 or not 0 <= pool_declined <= pool_assigned <= pool_total:
+                raise ValueError("Invalid Kea pool counters")
+            total += pool_total
+            assigned += pool_assigned
+            declined += pool_declined
+        if total <= 0:
+            raise ValueError("No Kea pool capacity")
+        # Declined leases are already included in assigned counters.
+        return total, assigned, declined
+
     def checklocal_kea(self):
         kea = (self._config_reader().get("OPNsense") or {}).get("Kea") or {}
         result = []
@@ -1013,6 +1041,7 @@ class checkmk_checker(object):
                 subnets = (live_config.get("Dhcp{0}".format(version)) or {}).get("subnet{0}".format(version), [])
                 if not isinstance(subnets, list):
                     raise ValueError("Invalid Kea subnets")
+                incomplete = False
                 for subnet in subnets:
                     sid = int(subnet["id"])
                     # Kea reports IPv4 address pools and IPv6 NA/PD pools separately.
@@ -1021,20 +1050,20 @@ class checkmk_checker(object):
                         pool_key = "pd-pools" if total_kind == "pds" else "pools"
                         if not subnet.get(pool_key):
                             continue
-                        prefix = "subnet[{0}].".format(sid)
-                        total = int(statistics[prefix + "total-" + total_kind][0][0])
-                        assigned = int(statistics[prefix + assigned_kind][0][0])
-                        declined = int(statistics.get(prefix + "declined-addresses", [[0]])[0][0]) if total_kind != "pds" else 0
-                        if total <= 0 or assigned < 0 or declined < 0:
-                            raise ValueError("Invalid Kea counters")
-                        # Declined leases are already included in assigned counters.
-                        used = assigned
+                        pool_name = re.sub(r'["\r\n]', "_", str(subnet.get("subnet", sid)))
+                        service = "{0} Pool {1} ({2}, {3})".format(label, pool_name, sid, total_kind)
+                        try:
+                            total, used, declined = self._kea_pool_usage(statistics, subnet, total_kind, assigned_kind)
+                        except (ValueError, TypeError, KeyError, IndexError):
+                            incomplete = True
+                            result.append('3 "{0}" - Pool-specific statistics unavailable or inconsistent; utilization unknown'.format(service))
+                            continue
                         usage = 100.0 * used / total
                         pool_status = 2 if usage >= 90 else 1 if usage >= 80 else 0
-                        pool_name = re.sub(r'["\r\n]', "_", str(subnet.get("subnet", sid)))
                         result.append('{0} "{1} Pool {2} ({3}, {4})" used={5}|total={6}|declined={7}|usage={8:.2f};80;90;0;100 {5}/{6} allocated or declined ({8:.1f}%)'.format(
                             pool_status, label, pool_name, sid, total_kind, used, total, declined, usage))
-                result.append('0 "{0} Statistics" - Pool statistics collected'.format(label))
+                result.append('{0} "{1} Statistics" - {2}'.format(3 if incomplete else 0, label,
+                    "Pool statistics incomplete or inconsistent" if incomplete else "Pool statistics collected"))
             except (OSError, ValueError, TypeError, KeyError, IndexError):
                 result.append('3 "{0} Statistics" - Pool statistics unavailable or invalid'.format(label))
         return result

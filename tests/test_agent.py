@@ -162,7 +162,10 @@ class KeaTests(unittest.TestCase):
         self.status = {"uptime": 123, "sockets": {"status": "ready"}}
         self.stats = {"subnet[7].total-addresses": [[100, "now"]],
                       "subnet[7].assigned-addresses": [[40, "now"]],
-                      "subnet[7].declined-addresses": [[5, "now"]]}
+                      "subnet[7].declined-addresses": [[5, "now"]],
+                      "subnet[7].pool[0].total-addresses": [[100, "now"]],
+                      "subnet[7].pool[0].assigned-addresses": [[40, "now"]],
+                      "subnet[7].pool[0].declined-addresses": [[5, "now"]]}
         self.live = {"Dhcp4": {"subnet4": [{"id": 7, "subnet": "192.0.2.0/24", "pools": [{"pool": "192.0.2.10-192.0.2.109"}]}]}}
         self.obj._kea_command = lambda path, cmd: {"status-get": self.status,
             "statistic-get-all": self.stats, "config-get": self.live}[cmd]
@@ -183,7 +186,7 @@ class KeaTests(unittest.TestCase):
     def test_thresholds(self):
         for assigned, state in ((79, 0), (80, 1), (90, 2), (100, 2)):
             with self.subTest(assigned=assigned):
-                self.stats["subnet[7].assigned-addresses"] = [[assigned, "now"]]
+                self.stats["subnet[7].pool[0].assigned-addresses"] = [[assigned, "now"]]
                 self.assertTrue(self.output()[1].startswith(str(state) + " "))
 
     def test_unavailable_socket_is_critical(self):
@@ -192,7 +195,55 @@ class KeaTests(unittest.TestCase):
 
     def test_invalid_statistics_are_unknown(self):
         self.stats.clear()
+        self.assertTrue(self.output()[1].startswith('3 "Kea DHCPv4 Pool'))
         self.assertTrue(self.output()[-1].startswith('3 "Kea DHCPv4 Statistics"'))
+
+    def test_out_of_pool_reservations_do_not_inflate_utilization(self):
+        # Reported production case: 58 subnet leases, only 15 pool addresses.
+        self.stats.update({"subnet[7].total-addresses": [[15]],
+                           "subnet[7].assigned-addresses": [[58]],
+                           "subnet[7].pool[0].total-addresses": [[15]],
+                           "subnet[7].pool[0].assigned-addresses": [[3]],
+                           "subnet[7].pool[0].declined-addresses": [[0]]})
+        output = self.output()[1]
+        self.assertTrue(output.startswith("0 "))
+        self.assertIn("used=3|total=15", output)
+        self.assertIn("usage=20.00", output)
+        self.assertNotIn("386.7", output)
+
+    def test_reservation_only_subnet_is_not_reported_as_pool(self):
+        self.live["Dhcp4"]["subnet4"][0]["pools"] = []
+        self.assertFalse(any('"Kea DHCPv4 Pool ' in line for line in self.output()))
+
+    def test_subnet_counters_are_not_used_when_pool_counters_missing(self):
+        self.stats = {key: value for key, value in self.stats.items() if ".pool[" not in key}
+        output = self.output()[1]
+        self.assertTrue(output.startswith("3 "))
+        self.assertNotIn("usage=", output)
+
+    def test_multiple_ranges_with_same_default_id_counted_once(self):
+        self.live["Dhcp4"]["subnet4"][0]["pools"].append({"pool": "192.0.2.150-192.0.2.199"})
+        self.assertIn("used=40|total=100", self.output()[1])
+
+    def test_distinct_pool_ids_are_aggregated(self):
+        self.live["Dhcp4"]["subnet4"][0]["pools"].append({"pool": "192.0.2.150-192.0.2.199", "pool-id": 5})
+        self.stats.update({"subnet[7].pool[5].total-addresses": [[50]],
+                           "subnet[7].pool[5].assigned-addresses": [[20]],
+                           "subnet[7].pool[5].declined-addresses": [[2]]})
+        self.assertIn("used=60|total=150|declined=7", self.output()[1])
+
+    def test_partial_pool_statistics_do_not_report_partial_total(self):
+        self.live["Dhcp4"]["subnet4"][0]["pools"].append({"pool": "192.0.2.150-192.0.2.199", "pool-id": 5})
+        self.assertTrue(self.output()[1].startswith("3 "))
+
+    def test_inconsistent_pool_counters_are_unknown_not_clamped(self):
+        for assigned, declined in ((101, 0), (-1, 0), (3, 5)):
+            with self.subTest(assigned=assigned, declined=declined):
+                self.stats["subnet[7].pool[0].assigned-addresses"] = [[assigned]]
+                self.stats["subnet[7].pool[0].declined-addresses"] = [[declined]]
+                output = self.output()[1]
+                self.assertTrue(output.startswith("3 "))
+                self.assertNotIn("usage=", output)
 
     def test_healthy_ha_standby_is_ok(self):
         self.status["high-availability"] = [{"ha-servers": {
@@ -224,7 +275,9 @@ class KeaTests(unittest.TestCase):
         self.config["OPNsense"]["Kea"] = {"dhcp6": {"general": {"enabled": "1"}}}
         self.live = {"Dhcp6": {"subnet6": [{"id": 7, "subnet": "2001:db8::/64", "pools": [{}], "pd-pools": [{}]}]}}
         self.stats = {"subnet[7].total-nas": [[100]], "subnet[7].assigned-nas": [[30]],
-                      "subnet[7].total-pds": [[10]], "subnet[7].assigned-pds": [[9]]}
+                      "subnet[7].total-pds": [[10]], "subnet[7].assigned-pds": [[9]],
+                      "subnet[7].pool[0].total-nas": [[100]], "subnet[7].pool[0].assigned-nas": [[30]],
+                      "subnet[7].pd-pool[0].total-pds": [[10]], "subnet[7].pd-pool[0].assigned-pds": [[9]]}
         output = self.output()
         self.assertIn("usage=30.00", output[1])
         self.assertTrue(output[2].startswith("2 "))
