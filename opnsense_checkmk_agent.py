@@ -32,7 +32,7 @@
 ##
 
 
-__VERSION__ = "1.2.18"
+__VERSION__ = "1.2.19"
 
 import sys
 import os
@@ -924,17 +924,22 @@ class checkmk_checker(object):
         return _ret
 
     @staticmethod
-    def _kea_command(path, command):
+    def _kea_command(path, command, arguments=None, timeout=5):
         """Read-only Kea UNIX control channel, with bounded time and reply size."""
-        if command not in ("status-get", "statistic-get-all", "config-get"):
+        if command not in ("status-get", "statistic-get-all", "config-get", "lease4-get-page", "lease6-get-page"):
             raise ValueError("Unsupported monitoring command")
-        deadline = time.monotonic() + 5
+        if timeout <= 0:
+            raise TimeoutError("Kea response timed out")
+        deadline = time.monotonic() + timeout
+        request = {"command": command}
+        if arguments is not None:
+            request["arguments"] = arguments
         decoder = json.JSONDecoder()
         data = bytearray()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5)
+            sock.settimeout(timeout)
             sock.connect(path)
-            sock.sendall(json.dumps({"command": command}).encode("utf-8"))
+            sock.sendall(json.dumps(request).encode("utf-8"))
             while len(data) < 8 * 1024 * 1024:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -950,8 +955,15 @@ class checkmk_checker(object):
                     continue
                 if isinstance(response, list) and len(response) == 1:
                     response = response[0]
-                if not isinstance(response, dict) or response.get("result") != 0:
-                    raise ValueError("Kea command failed: {0}".format(command))
+                if not isinstance(response, dict):
+                    raise ValueError("Invalid Kea reply")
+                if command in ("lease4-get-page", "lease6-get-page") and response.get("result") == 3:
+                    empty_arguments = response.get("arguments")
+                    if isinstance(empty_arguments, dict) and empty_arguments.get("leases") == []:
+                        return {"leases": []}
+                    raise ValueError("Invalid empty Kea lease reply")
+                if response.get("result") != 0:
+                    raise ValueError("Kea {0} failed (result {1})".format(command, response.get("result")))
                 arguments = response.get("arguments")
                 if not isinstance(arguments, dict):
                     raise ValueError("Kea reply has no arguments")
@@ -985,6 +997,116 @@ class checkmk_checker(object):
             raise ValueError("No Kea pool capacity")
         # Declined leases are already included in assigned counters.
         return total, assigned, declined
+
+    def _kea_leases(self, path, version):
+        """Bounded, paged lease snapshot, cached for 30 seconds on a running agent."""
+        cached = self._get_storedata("kea_leases", path)
+        if cached and 0 <= time.monotonic() - cached[0] < 30:
+            return cached[1]
+        deadline = time.monotonic() + 5
+        cursor = "start"
+        cursors = set()
+        leases = []
+        fields = ("subnet-id", "ip-address", "type", "prefix-len", "state", "cltt", "valid-lft")
+        for _ in range(100):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Kea lease scan exceeded 5 seconds")
+            page = self._kea_command(path, "lease{0}-get-page".format(version),
+                {"from": cursor, "limit": 1024}, timeout=remaining).get("leases")
+            if not isinstance(page, list) or not all(isinstance(lease, dict) for lease in page):
+                raise ValueError("Invalid Kea lease page")
+            if len(page) > 1024:
+                raise ValueError("Kea lease page exceeds requested size")
+            leases.extend({field: lease[field] for field in fields if field in lease} for lease in page)
+            if len(page) < 1024:
+                self._set_storedata("kea_leases", path, (time.monotonic(), leases))
+                return leases
+            cursor = page[-1].get("ip-address")
+            if not cursor or cursor in cursors:
+                raise ValueError("Kea lease pagination did not advance")
+            cursors.add(cursor)
+        raise ValueError("Kea lease scan exceeded 100 pages")
+
+    @staticmethod
+    def _kea_pool_lease_usage(leases, subnet, total_kind, version):
+        """Count live leases inside configured ranges; never enumerate a pool."""
+        sid = int(subnet["id"])
+        is_pd = total_kind == "pds"
+        ranges = []
+        for pool in subnet["pd-pools" if is_pd else "pools"]:
+            delegated = None
+            if is_pd:
+                network = ipaddress.ip_network("{0}/{1}".format(pool["prefix"], pool["prefix-len"]), strict=False)
+                delegated = int(pool["delegated-len"])
+                if not network.prefixlen <= delegated <= 128:
+                    raise ValueError("Invalid Kea delegated prefix length")
+                first, last = network.network_address, network.broadcast_address
+            else:
+                value = pool["pool"].strip()
+                if "/" in value:
+                    network = ipaddress.ip_network(value, strict=False)
+                    first, last = network.network_address, network.broadcast_address
+                elif "-" in value:
+                    first, last = (ipaddress.ip_address(part.strip()) for part in value.split("-", 1))
+                else:
+                    first = last = ipaddress.ip_address(value)
+            if first.version != version or last.version != version or int(first) > int(last):
+                raise ValueError("Invalid Kea pool range")
+            ranges.append((int(first), int(last), delegated))
+        ranges.sort()
+        merged = []
+        for first, last, delegated in ranges:
+            if merged and first <= merged[-1][1]:
+                if is_pd:
+                    raise ValueError("Overlapping Kea PD pools")
+                merged[-1] = (merged[-1][0], max(last, merged[-1][1]), None)
+            else:
+                merged.append((first, last, delegated))
+        total = sum((last - first + 1) // (1 << (128 - delegated)) if is_pd else last - first + 1
+                    for first, last, delegated in merged)
+        if total <= 0:
+            raise ValueError("No Kea pool capacity")
+        used = declined = 0
+        seen = set()
+        now = time.time()
+        for lease in leases:
+            if int(lease["subnet-id"]) != sid:
+                continue
+            lease_type = lease.get("type", "IA_NA")
+            if version == 6 and lease_type != ("IA_PD" if is_pd else "IA_NA"):
+                continue
+            address = ipaddress.ip_address(lease["ip-address"])
+            if address.version != version:
+                raise ValueError("Kea lease address family mismatch")
+            number = int(address)
+            prefixlen = int(lease["prefix-len"]) if is_pd else None
+            matches = [(first, last, delegated) for first, last, delegated in merged if first <= number <= last]
+            if not matches:
+                continue  # Reservation outside the dynamic pool.
+            if is_pd:
+                if not any(prefixlen == delegated and number % (1 << (128 - delegated)) == 0
+                           and number + (1 << (128 - delegated)) - 1 <= last for first, last, delegated in matches):
+                    raise ValueError("Kea lease does not match delegated pool size")
+            state = int(lease.get("state", 0))
+            if state in (2, 3, 4):
+                continue  # Reclaimed, released, or self-generated, not allocated.
+            if state not in (0, 1):
+                raise ValueError("Unknown Kea lease state")
+            lifetime = int(lease["valid-lft"])
+            if lifetime < 0:
+                raise ValueError("Invalid Kea lease lifetime")
+            if lifetime != 0xffffffff and int(lease["cltt"]) + lifetime <= now:
+                continue
+            identity = (number, prefixlen)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            used += 1
+            declined += int(state == 1)
+        if used > total:
+            raise ValueError("Kea lease count exceeds pool capacity")
+        return total, used, declined
 
     def checklocal_kea(self):
         kea = (self._config_reader().get("OPNsense") or {}).get("Kea") or {}
@@ -1042,6 +1164,8 @@ class checkmk_checker(object):
                 if not isinstance(subnets, list):
                     raise ValueError("Invalid Kea subnets")
                 incomplete = False
+                lease_snapshot = None
+                lease_error = None
                 for subnet in subnets:
                     sid = int(subnet["id"])
                     # Kea reports IPv4 address pools and IPv6 NA/PD pools separately.
@@ -1052,16 +1176,30 @@ class checkmk_checker(object):
                             continue
                         pool_name = re.sub(r'["\r\n]', "_", str(subnet.get("subnet", sid)))
                         service = "{0} Pool {1} ({2}, {3})".format(label, pool_name, sid, total_kind)
+                        source = "pool counters"
                         try:
                             total, used, declined = self._kea_pool_usage(statistics, subnet, total_kind, assigned_kind)
-                        except (ValueError, TypeError, KeyError, IndexError):
-                            incomplete = True
-                            result.append('3 "{0}" - Pool-specific statistics unavailable or inconsistent; utilization unknown'.format(service))
-                            continue
+                        except (ValueError, TypeError, KeyError, IndexError) as counter_error:
+                            try:
+                                if lease_error:
+                                    raise ValueError(lease_error)
+                                if lease_snapshot is None:
+                                    try:
+                                        lease_snapshot = self._kea_leases(path, version)
+                                    except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
+                                        lease_error = "{0}: {1}".format(type(error).__name__, error)
+                                        raise
+                                total, used, declined = self._kea_pool_lease_usage(lease_snapshot, subnet, total_kind, version)
+                                source = "lease snapshot, cached up to 30s"
+                            except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
+                                incomplete = True
+                                detail = re.sub(r'[\r\n]', " ", "counters: {0}; leases: {1}".format(counter_error, error))
+                                result.append('3 "{0}" - Pool utilization unknown ({1})'.format(service, detail))
+                                continue
                         usage = 100.0 * used / total
                         pool_status = 2 if usage >= 90 else 1 if usage >= 80 else 0
-                        result.append('{0} "{1} Pool {2} ({3}, {4})" used={5}|total={6}|declined={7}|usage={8:.2f};80;90;0;100 {5}/{6} allocated or declined ({8:.1f}%)'.format(
-                            pool_status, label, pool_name, sid, total_kind, used, total, declined, usage))
+                        result.append('{0} "{1} Pool {2} ({3}, {4})" used={5}|total={6}|declined={7}|usage={8:.2f};80;90;0;100 {5}/{6} allocated or declined ({8:.1f}%, {9})'.format(
+                            pool_status, label, pool_name, sid, total_kind, used, total, declined, usage, source))
                 result.append('{0} "{1} Statistics" - {2}'.format(3 if incomplete else 0, label,
                     "Pool statistics incomplete or inconsistent" if incomplete else "Pool statistics collected"))
             except (OSError, ValueError, TypeError, KeyError, IndexError):

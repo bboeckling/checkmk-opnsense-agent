@@ -302,6 +302,118 @@ class KeaTests(unittest.TestCase):
                 with self.assertRaises((ValueError, ConnectionError)):
                     Checker._kea_command("test", "status-get")
 
+    def test_lease_fallback_excludes_outside_reservations(self):
+        self.stats.clear()
+        self.live["Dhcp4"]["subnet4"][0]["pools"] = [{"pool": "192.0.2.100-192.0.2.114"}]
+        leases = [self.lease("192.0.2.100"), self.lease("192.0.2.101")]
+        leases += [self.lease("192.0.2.{0}".format(i)) for i in range(1, 57)]
+        self.obj._kea_leases = Mock(return_value=leases)
+        output = self.output()[1]
+        self.assertTrue(output.startswith("0 "))
+        self.assertIn("used=2|total=15", output)
+        self.assertIn("usage=13.33", output)
+        self.assertIn("lease snapshot", output)
+
+    def test_inconsistent_counters_use_lease_fallback(self):
+        self.stats["subnet[7].pool[0].assigned-addresses"] = [[1000]]
+        self.obj._kea_leases = Mock(return_value=[self.lease("192.0.2.20")])
+        self.assertIn("used=1|total=100", self.output()[1])
+
+    @staticmethod
+    def lease(address, **fields):
+        return dict({"ip-address": address, "subnet-id": 7, "state": 0,
+                     "cltt": int(time.time()), "valid-lft": 3600}, **fields)
+
+    def test_lease_fallback_filters_expired_reclaimed_and_released(self):
+        subnet = {"id": 7, "pools": [{"pool": "192.0.2.0/28"}]}
+        leases = [self.lease("192.0.2.1"), self.lease("192.0.2.2", state=1),
+                  self.lease("192.0.2.3", state=2), self.lease("192.0.2.4", state=3),
+                  self.lease("192.0.2.5", cltt=0, **{"valid-lft": 1}),
+                  self.lease("192.0.2.1"), self.lease("192.0.2.6", **{"subnet-id": 8}),
+                  self.lease("192.0.2.7", cltt=0, **{"valid-lft": 0xffffffff})]
+        self.assertEqual((16, 3, 1), Checker._kea_pool_lease_usage(leases, subnet, "addresses", 4))
+
+    def test_fallback_empty_database_is_valid_zero_usage(self):
+        subnet = {"id": 7, "pools": [{"pool": "192.0.2.1-192.0.2.15"}]}
+        self.assertEqual((15, 0, 0), Checker._kea_pool_lease_usage([], subnet, "addresses", 4))
+
+    def test_overlapping_address_ranges_are_not_double_counted(self):
+        subnet = {"id": 7, "pools": [{"pool": "192.0.2.1-192.0.2.10"}, {"pool": "192.0.2.5-192.0.2.15"}]}
+        self.assertEqual((15, 1, 0), Checker._kea_pool_lease_usage([self.lease("192.0.2.7")], subnet, "addresses", 4))
+
+    def test_fallback_ipv6_ignores_outside_reservations(self):
+        subnet = {"id": 7, "pools": [{"pool": "2001:db8::10-2001:db8::1f"}]}
+        leases = [self.lease("2001:db8::10", type="IA_NA"), self.lease("2001:db8::1", type="IA_NA")]
+        self.assertEqual((16, 1, 0), Checker._kea_pool_lease_usage(leases, subnet, "nas", 6))
+
+    def test_fallback_prefix_delegation_counts_prefix_slots(self):
+        subnet = {"id": 7, "pd-pools": [{"prefix": "2001:db8:1::", "prefix-len": 56, "delegated-len": 60}]}
+        leases = [self.lease("2001:db8:1::", type="IA_PD", **{"prefix-len": 60}),
+                  self.lease("2001:db8:2::", type="IA_PD", **{"prefix-len": 60}),
+                  self.lease("2001:db8:1::10", type="IA_NA")]
+        self.assertEqual((16, 1, 0), Checker._kea_pool_lease_usage(leases, subnet, "pds", 6))
+
+    def test_fallback_queries_leases_only_once_for_multiple_subnets(self):
+        self.stats.clear()
+        self.live["Dhcp4"]["subnet4"].append({"id": 8, "subnet": "198.51.100.0/24", "pools": [{"pool": "198.51.100.10-198.51.100.20"}]})
+        self.obj._kea_leases = Mock(return_value=[self.lease("192.0.2.20")])
+        output = self.output()
+        self.assertIn("used=1|total=100", output[1])
+        self.assertIn("used=0|total=11", output[2])
+        self.obj._kea_leases.assert_called_once()
+
+    def test_fallback_failure_has_concrete_diagnostic(self):
+        self.stats.clear()
+        self.obj._kea_leases = Mock(side_effect=ValueError("Kea lease4-get-page failed (result 2)"))
+        output = self.output()[1]
+        self.assertTrue(output.startswith("3 "))
+        self.assertIn("subnet[7].pool[0].total-addresses", output)
+        self.assertIn("lease4-get-page failed (result 2)", output)
+
+    def test_lease_pagination_and_cache(self):
+        obj = checker()
+        page = [self.lease("192.0.2.1")] * 1023 + [self.lease("192.0.2.2")]
+        obj._kea_command = Mock(side_effect=[{"leases": page}, {"leases": [self.lease("192.0.2.3")]}])
+        leases = obj._kea_leases("socket", 4)
+        self.assertEqual(1025, len(leases))
+        self.assertEqual("192.0.2.2", obj._kea_command.call_args_list[1].args[2]["from"])
+        self.assertEqual(leases, obj._kea_leases("socket", 4))
+        self.assertEqual(2, obj._kea_command.call_count)
+
+    def test_failed_or_repeated_pages_are_not_cached(self):
+        obj = checker()
+        obj._kea_command = Mock(return_value={"leases": [self.lease("192.0.2.1")] * 1024})
+        with self.assertRaisesRegex(ValueError, "did not advance"):
+            obj._kea_leases("socket", 4)
+        self.assertIsNone(obj._get_storedata("kea_leases", "socket"))
+        obj._kea_command = Mock(side_effect=[{"leases": [self.lease("192.0.2.1")] * 1024}, TimeoutError("scan timed out")])
+        with self.assertRaises(TimeoutError):
+            obj._kea_leases("socket", 4)
+        self.assertIsNone(obj._get_storedata("kea_leases", "socket"))
+
+    def test_control_channel_paged_request_and_empty_result(self):
+        sock = Mock()
+        sock.__enter__ = Mock(return_value=sock)
+        sock.__exit__ = Mock(return_value=False)
+        sock.recv.return_value = b'{"result":3,"arguments":{"leases":[]}}'
+        with patch.object(socket, "socket", return_value=sock), patch.object(socket, "AF_UNIX", 1, create=True):
+            self.assertEqual({"leases": []}, Checker._kea_command("socket", "lease4-get-page", {"from": "start", "limit": 1024}))
+        self.assertEqual({"command": "lease4-get-page", "arguments": {"from": "start", "limit": 1024}}, json.loads(sock.sendall.call_args.args[0]))
+
+    def test_lease_scan_deadline_does_not_return_partial_counts(self):
+        obj = checker()
+        obj._kea_command = Mock(return_value={"leases": [self.lease("192.0.2.1")] * 1024})
+        with patch.object(time, "monotonic", side_effect=[0, 0, 6]):
+            with self.assertRaisesRegex(TimeoutError, "exceeded 5 seconds"):
+                obj._kea_leases("socket", 4)
+        self.assertIsNone(obj._get_storedata("kea_leases", "socket"))
+
+    def test_invalid_delegated_prefix_is_not_counted_as_healthy(self):
+        subnet = {"id": 7, "pd-pools": [{"prefix": "2001:db8:1::", "prefix-len": 56, "delegated-len": 60}]}
+        leases = [self.lease("2001:db8:1::", type="IA_PD", **{"prefix-len": 64})]
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            Checker._kea_pool_lease_usage(leases, subnet, "pds", 6)
+
 
 class BGPTests(unittest.TestCase):
     def setUp(self):

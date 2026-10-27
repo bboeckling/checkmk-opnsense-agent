@@ -27,7 +27,7 @@ The original installation steps are retained; the download URL points to this fo
 
 **Added or improved in this fork:**
 
-- **Kea DHCPv4/v6:** service and HA status, address/prefix pool utilization (WARN 80%, CRIT 90%); reservations outside the pools do not inflate utilization. Missing pool counters produce UNKNOWN.
+- **Kea DHCPv4/v6:** service and HA status, address/prefix pool utilization (WARN 80%, CRIT 90%), excluding reservations outside the pools. Missing or inconsistent counters trigger a bounded, paged lease lookup; failed lookups produce UNKNOWN.
 - **FRR BGP:** neighbor state, prefix counters and policy warnings, checked independently on both firewalls.
 - **WireGuard with CARP:** intentional standby is OK; takeover requires a new handshake after a configurable grace period (default 120 seconds). Traffic counters are separated per peer.
 - **Compatibility and reliability:** OpenVPN instances, IPsec Connections, and fixes for inventory, audit results, tasks, certificates, timeouts, restarts and updates.
