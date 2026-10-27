@@ -32,7 +32,7 @@
 ##
 
 
-__VERSION__ = "1.2.16"
+__VERSION__ = "1.2.17"
 
 import sys
 import os
@@ -51,6 +51,8 @@ import threading
 import ipaddress
 import base64
 import traceback
+import tempfile
+import shutil
 import syslog
 import requests
 import hashlib
@@ -89,6 +91,35 @@ TASKFILE_KEYS = "service|type|interval|interface|disabled|ipaddress|hostname|dom
 TASKFILE_REGEX = re.compile(rf"^({TASKFILE_KEYS}):\s*(.*?)(?:\s+#|$)",re.M)
 MAX_SIMULATAN_THREADS = 4
 
+def as_list(value):
+    """XML collections are dictionaries for a single item and lists otherwise."""
+    return value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+
+def normalize_ip(address):
+    parsed = ipaddress.ip_address(address.strip())
+    return str(parsed.ipv4_mapped or parsed) if isinstance(parsed, ipaddress.IPv6Address) else str(parsed)
+
+def replace_agent(path, source):
+    """Validate, back up, and atomically replace an installed agent."""
+    compile(source, path, "exec")
+    original = os.stat(path)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path), delete=False) as target:
+            temp_path = target.name
+            target.write(source)
+            target.flush()
+            os.fsync(target.fileno())
+        if hasattr(os, "chown"):
+            os.chown(temp_path, original.st_uid, original.st_gid)
+        os.chmod(temp_path, original.st_mode)
+        shutil.copy2(path, path + ".bak")
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            os.unlink(temp_path)
+
 for _dir in (BASEDIR, VARDIR, LOCALDIR, PLUGINSDIR, SPOOLDIR, TASKDIR):
     if not os.path.exists(_dir):
         try:
@@ -98,7 +129,7 @@ for _dir in (BASEDIR, VARDIR, LOCALDIR, PLUGINSDIR, SPOOLDIR, TASKDIR):
 
 os.environ["MK_CONFDIR"] = MK_CONFDIR
 os.environ["MK_LIBDIR"] = BASEDIR
-os.environ["MK_VARDIR"] = BASEDIR
+os.environ["MK_VARDIR"] = VARDIR
 
 class object_dict(defaultdict):
     def __getattr__(self,name):
@@ -147,6 +178,7 @@ class NginxConnection(HTTPConnection):
         super().__init__("localhost")
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
         self.sock.connect("/var/run/nginx_status.sock")
 
 class NginxConnectionPool(HTTPConnectionPool):
@@ -173,7 +205,7 @@ class checkmk_handler(StreamRequestHandler):
     def handle(self):
         with self.server._mutex:
             try:
-                _strmsg = self.server.do_checks(remote_ip=self.client_address[0])
+                _strmsg = self.server.do_checks(remote_ip=normalize_ip(self.client_address[0]))
             except Exception as e:
                 raise
                 _strmsg = str(e).encode("utf-8")
@@ -239,9 +271,14 @@ class checkmk_checker(object):
             modes.CBC(_iv),
             backend = _backend
         ).decryptor()
-        _decrypted_message = _decryptor.update(message)
+        _decrypted_message = _decryptor.update(message) + _decryptor.finalize()
+        if not _decrypted_message:
+            return "invalid key"
+        _pad = _decrypted_message[-1]
+        if not 1 <= _pad <= 16 or _decrypted_message[-_pad:] != bytes([_pad]) * _pad:
+            return "invalid key"
         try:
-            return _decrypted_message.decode("utf-8").strip()
+            return _decrypted_message[:-_pad].decode("utf-8")
         except UnicodeDecodeError:
             return ("invalid key")
 
@@ -251,7 +288,7 @@ class checkmk_checker(object):
         _ret = True
         if _lastaccess + self.expire_inventory > _now:
             _ret = False
-        for _ip, _time in self._ipaccess_log.items():
+        for _ip, _time in list(self._ipaccess_log.items()):
             if _time + self.expire_inventory < _now:
                 del self._ipaccess_log[_ip]
         self._ipaccess_log[remote_ip] = _now
@@ -345,7 +382,9 @@ class checkmk_checker(object):
         if os.path.isdir(SPOOLDIR):
             _now = time.time()
             for _filename in glob.glob(f"{SPOOLDIR}/*"):
-                _maxage = re.search(r"^(\d+)_",_filename)
+                if not os.path.isfile(_filename):
+                    continue
+                _maxage = re.search(r"^(\d+)_",os.path.basename(_filename))
 
                 if _maxage:
                     _maxage = int(_maxage.group(1))
@@ -417,14 +456,17 @@ class checkmk_checker(object):
         _mayor_upgrade = None
         try:
             _upgrade_json = json.load(open("/tmp/pkg_upgrade.json","r"))
-            _upgrade_packages = dict(map(lambda x: (x.get("name"),x),_upgrade_json.get("upgrade_packages")))
+            _upgrade_packages = dict(map(lambda x: (x.get("name"),x),_upgrade_json["upgrade_packages"]))
             _mayor_upgrade = _upgrade_json.get("upgrade_major_version")
             _opnsense_package = _upgrade_packages.get("opnsense",_upgrade_packages.get("opnsense-business"))
-            _current_firmware["version"] = _opnsense_package.get("current_version")
-            _latest_firmware["version"] = _opnsense_package.get("new_version")
+            if _opnsense_package:
+                _current_firmware["version"] = _opnsense_package["current_version"]
+                _latest_firmware["version"] = _opnsense_package["new_version"]
+            else:
+                _latest_firmware["version"] = _current_firmware.get("version", _info.get("product_version", "unknown"))
         except:
-            _current_firmware["version"] = _current_firmware["version"].split("_")[0]
-            _latest_firmware["version"] = _current_firmware["version"] ## fixme ## no upgradepckg error on opnsense ... no new version
+            _current_firmware["version"] = (_current_firmware.get("version") or _info.get("product_version", "unknown")).split("_")[0]
+            _latest_firmware["version"] = "unknown"
         self._info = {
             "os"                : _info.get("product_name"),
             "os_version"        : _current_firmware.get("version","unknown"),
@@ -533,6 +575,8 @@ class checkmk_checker(object):
         return _ifs
 
     def checklocal_firmware(self):
+        if self._info.get("latest_version") == "unknown":
+            return ['3 Firmware - Update information unavailable; installed version {os_version}'.format(**self._info)]
         if self._info.get("os_version") != self._info.get("latest_version"):
             return ["1 Firmware update_available=1|last_updated={version_age:.0f}|apply_finish_time={config_age:.0f} Version {os_version} ({latest_version} available {latest_date}) Config changed: {last_configchange}".format(**self._info)]
         return ["0 Firmware update_available=0|last_updated={version_age:.0f}|apply_finish_time={config_age:.0f} Version {os_version}  Config changed: {last_configchange}".format(**self._info)]
@@ -543,6 +587,119 @@ class checkmk_checker(object):
             _date = self._info.get("business_expire").strftime("%d.%m.%Y")
             return [f'P "Business Licence" expiredays={_days};60:;30:; Licence Expire: {_date}']
         return []
+
+    @staticmethod
+    def _bgp_summary_peers(summary):
+        """Normalize FRR summary JSON, retaining VRF and address family."""
+        if not isinstance(summary, dict):
+            raise ValueError("Invalid FRR summary")
+        families = {"ipv4Unicast", "ipv6Unicast", "ipv4Multicast", "ipv6Multicast",
+                    "ipv4Vpn", "ipv6Vpn", "ipv4LabeledUnicast", "ipv6LabeledUnicast",
+                    "ipv4Flowspec", "ipv6Flowspec", "l2VpnEvpn"}
+        vrfs = {"default": summary} if families.intersection(summary) else summary
+        peers = {}
+        for vrf, tables in vrfs.items():
+            if not isinstance(tables, dict) or (tables and not families.intersection(tables)):
+                raise ValueError("Unrecognized FRR summary structure")
+            for family in families.intersection(tables):
+                table = tables[family]
+                if not isinstance(table, dict) or not isinstance(table.get("peers", {}), dict):
+                    raise ValueError("Invalid FRR peer table")
+                for address, peer in table.get("peers", {}).items():
+                    if not isinstance(peer, dict) or not isinstance(peer.get("state"), str):
+                        raise ValueError("Invalid FRR peer state")
+                    try:
+                        address = normalize_ip(address)
+                    except ValueError:
+                        pass  # FRR also supports interface-based neighbors.
+                    peers[(vrf, family, address)] = peer
+        return peers
+
+    def checklocal_bgp(self):
+        routing = (self._config_reader().get("OPNsense") or {}).get("quagga") or {}
+        general = routing.get("general") or {}
+        bgp = routing.get("bgp") or {}
+        if general.get("enabled") != "1" or bgp.get("enabled") != "1":
+            return []
+        expected = {}
+        disabled = set()
+        groups = {group.get("@uuid"): group for group in as_list((bgp.get("peergroups") or {}).get("peergroup"))}
+        for neighbor in as_list((bgp.get("neighbors") or {}).get("neighbor")):
+            address = neighbor.get("address")
+            if not address:
+                continue
+            try:
+                address = normalize_ip(address)
+            except ValueError:
+                pass
+            if neighbor.get("enabled", "1") == "0":
+                disabled.add(address)
+                continue
+            group = groups.get(neighbor.get("peergroup"), {})
+            for family in (neighbor.get("family") or group.get("family") or "ipv4").split(","):
+                family_name = {"ipv4": "ipv4Unicast", "ipv6": "ipv6Unicast"}.get(family.strip())
+                if family_name:
+                    expected[("default", family_name, address)] = neighbor
+        previous = self._get_storedata("bgp", "peers") or {}
+        error_status = None
+        try:
+            # Deliberately independent of CARP: both routers may run BGP.
+            output = subprocess.check_output(["/usr/local/bin/vtysh", "-c", "show bgp vrf all summary json"],
+                encoding="utf-8", stderr=subprocess.DEVNULL, timeout=5)
+            peers = self._bgp_summary_peers(json.loads(output))
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            peers, error_status, error_detail = {}, 2, "FRR BGP query failed or vtysh unavailable"
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            peers, error_status, error_detail = {}, 3, "FRR BGP summary unavailable or invalid"
+        if error_status is None:
+            peers = {key: peer for key, peer in peers.items() if key[0] != "default" or key[2] not in disabled}
+            monitored = set(peers) | set(expected)
+            self._set_storedata("bgp", "peers", dict.fromkeys(monitored))
+        else:
+            monitored = set(expected) | {key for key in previous if key[0] != "default" or key[2] not in disabled}
+        result = []
+        worst = error_status or 0
+        established = 0
+        for key in sorted(monitored):
+            vrf, family, address = key
+            peer = peers.get(key)
+            metrics = []
+            if error_status is not None:
+                status, detail = error_status, error_detail
+            elif peer is None:
+                status, detail = 2, "Configured neighbor missing from FRR summary"
+                metrics.append("established=0")
+            else:
+                up = peer["state"] == "Established"
+                established += int(up)
+                status = 0 if up else 2
+                policy = peer.get("peerState") == "Policy" or any(peer.get(field) == "(Policy)" for field in ("pfxRcd", "pfxSnt"))
+                if policy:
+                    status = max(status, 1)
+                detail = "{0}, remote AS {1}{2}".format(peer["state"], peer.get("remoteAs", "unknown"),
+                    "; missing inbound/outbound policy" if policy else "")
+                metrics.append("established={0}".format(int(up)))
+                for field, metric in (("pfxRcd", "prefixes_received"), ("pfxSnt", "prefixes_sent"),
+                                      ("msgRcvd", "messages_received"), ("msgSent", "messages_sent"),
+                                      ("connectionsDropped", "connections_dropped")):
+                    value = peer.get(field)
+                    if isinstance(value, (int, float)) and value >= 0:
+                        metrics.append("{0}={1}".format(metric, value))
+                uptime = peer.get("peerUptimeMsec")
+                if up and isinstance(uptime, (int, float)) and uptime >= 0:
+                    metrics.append("uptime={0}".format(uptime / 1000))
+            worst = max(worst, status)
+            name = re.sub(r'["\r\n]', "_", "BGP {0} {1} {2}".format(vrf, family, address))
+            description = expected.get(key, {}).get("description") or ""
+            detail = re.sub(r'[\r\n]', " ", detail + (" - " + description if description else ""))
+            result.append('{0} "{1}" {2} {3}'.format(status, name, "|".join(metrics) or "-", detail))
+        if error_status is not None:
+            summary_line = '{0} "BGP FRR" - {1}'.format(error_status, error_detail)
+        else:
+            if not monitored:
+                worst = 1
+            summary_line = '{0} "BGP FRR" sessions={1}|established={2} {2}/{1} sessions established'.format(worst, len(monitored), established)
+        return [summary_line] + result
 
     def check_label(self):
         _ret = ["<<<labels:sep(0)>>>"]
@@ -675,7 +832,12 @@ class checkmk_checker(object):
     def checklocal_services(self):
         _phpcode = '<?php require_once("config.inc");require_once("system.inc"); require_once("plugins.inc"); require_once("util.inc"); foreach(plugins_services() as $_service) { printf("%s;%s;%s\n",$_service["name"],$_service["description"],service_status($_service));} ?>'
         _proc = subprocess.Popen(["php"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,encoding="utf-8")
-        _data,_ = _proc.communicate(input=_phpcode,timeout=15)
+        try:
+            _data,_ = _proc.communicate(input=_phpcode,timeout=15)
+        except subprocess.TimeoutExpired:
+            _proc.kill()
+            _proc.communicate()
+            return ['3 Services - Service status query timed out']
         _services = []
         for _service in _data.strip().split("\n"):
             _services.append(_service.split(";"))
@@ -761,21 +923,137 @@ class checkmk_checker(object):
             pass
         return _ret
 
+    @staticmethod
+    def _kea_command(path, command):
+        """Read-only Kea UNIX control channel, with bounded time and reply size."""
+        if command not in ("status-get", "statistic-get-all", "config-get"):
+            raise ValueError("Unsupported monitoring command")
+        deadline = time.monotonic() + 5
+        decoder = json.JSONDecoder()
+        data = bytearray()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect(path)
+            sock.sendall(json.dumps({"command": command}).encode("utf-8"))
+            while len(data) < 8 * 1024 * 1024:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Kea response timed out")
+                sock.settimeout(remaining)
+                part = sock.recv(65536)
+                if not part:
+                    raise ConnectionError("Kea closed an incomplete response")
+                data.extend(part)
+                try:
+                    response, end = decoder.raw_decode(data.decode("utf-8").lstrip())
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(response, list) and len(response) == 1:
+                    response = response[0]
+                if not isinstance(response, dict) or response.get("result") != 0:
+                    raise ValueError("Kea command failed: {0}".format(command))
+                arguments = response.get("arguments")
+                if not isinstance(arguments, dict):
+                    raise ValueError("Kea reply has no arguments")
+                return arguments
+        raise ValueError("Kea response too large")
+
+    def checklocal_kea(self):
+        kea = (self._config_reader().get("OPNsense") or {}).get("Kea") or {}
+        result = []
+        for version in (4, 6):
+            settings = kea.get("dhcp{0}".format(version)) or {}
+            if (settings.get("general") or {}).get("enabled") != "1":
+                continue
+            label = "Kea DHCPv{0}".format(version)
+            path = "/var/run/kea/kea{0}-ctrl-socket".format(version)
+            try:
+                status = self._kea_command(path, "status-get")
+                if not isinstance(status.get("uptime"), (int, float)):
+                    raise ValueError("Missing uptime")
+            except (OSError, ValueError, TypeError) as error:
+                result.append('2 "{0}" - Control socket unavailable or invalid ({1})'.format(label, type(error).__name__))
+                continue
+            severity = 0
+            details = ["running"]
+            socket_status = (status.get("sockets") or {}).get("status")
+            if socket_status in ("failed", "retrying"):
+                severity = 2 if socket_status == "failed" else 1
+                details.append("DHCP sockets " + socket_status)
+            ha = status.get("high-availability") or []
+            if (settings.get("ha") or {}).get("enabled") == "1" and not ha:
+                severity = max(severity, 3)
+                details.append("configured HA status missing")
+            for relationship in ha:
+                servers = relationship.get("ha-servers") or {}
+                local = servers.get("local") or {}
+                remote = servers.get("remote") or {}
+                state = local.get("state", "unknown")
+                details.append("HA {0}/{1}".format(local.get("role", "unknown"), state))
+                if state in ("terminated", "unavailable"):
+                    severity = max(severity, 2)
+                elif state not in ("hot-standby", "load-balancing", "ready", "backup", "passive-backup"):
+                    severity = max(severity, 1)
+                if remote and (not remote.get("in-touch") or remote.get("communication-interrupted")):
+                    severity = max(severity, 1)
+                    details.append("HA partner communication unavailable")
+            if (status.get("dhcp-state") or {}).get("globally-disabled"):
+                # A healthy HA standby may intentionally have no active scopes.
+                standby = bool(ha) and all(
+                    (relationship.get("ha-servers") or {}).get("local", {}).get("role") in ("standby", "backup")
+                    and not (relationship.get("ha-servers") or {}).get("local", {}).get("scopes")
+                    for relationship in ha)
+                if not standby:
+                    severity = max(severity, 2)
+                details.append("DHCP globally disabled")
+            result.append('{0} "{1}" uptime={2} {3}'.format(severity, label, status["uptime"], "; ".join(details)))
+            try:
+                statistics = self._kea_command(path, "statistic-get-all")
+                live_config = self._kea_command(path, "config-get")
+                subnets = (live_config.get("Dhcp{0}".format(version)) or {}).get("subnet{0}".format(version), [])
+                if not isinstance(subnets, list):
+                    raise ValueError("Invalid Kea subnets")
+                for subnet in subnets:
+                    sid = int(subnet["id"])
+                    # Kea reports IPv4 address pools and IPv6 NA/PD pools separately.
+                    kinds = (("addresses", "assigned-addresses"),) if version == 4 else (("nas", "assigned-nas"), ("pds", "assigned-pds"))
+                    for total_kind, assigned_kind in kinds:
+                        pool_key = "pd-pools" if total_kind == "pds" else "pools"
+                        if not subnet.get(pool_key):
+                            continue
+                        prefix = "subnet[{0}].".format(sid)
+                        total = int(statistics[prefix + "total-" + total_kind][0][0])
+                        assigned = int(statistics[prefix + assigned_kind][0][0])
+                        declined = int(statistics.get(prefix + "declined-addresses", [[0]])[0][0]) if total_kind != "pds" else 0
+                        if total <= 0 or assigned < 0 or declined < 0:
+                            raise ValueError("Invalid Kea counters")
+                        # Declined leases are already included in assigned counters.
+                        used = assigned
+                        usage = 100.0 * used / total
+                        pool_status = 2 if usage >= 90 else 1 if usage >= 80 else 0
+                        pool_name = re.sub(r'["\r\n]', "_", str(subnet.get("subnet", sid)))
+                        result.append('{0} "{1} Pool {2} ({3}, {4})" used={5}|total={6}|declined={7}|usage={8:.2f};80;90;0;100 {5}/{6} allocated or declined ({8:.1f}%)'.format(
+                            pool_status, label, pool_name, sid, total_kind, used, total, declined, usage))
+                result.append('0 "{0} Statistics" - Pool statistics collected'.format(label))
+            except (OSError, ValueError, TypeError, KeyError, IndexError):
+                result.append('3 "{0} Statistics" - Pool statistics unavailable or invalid'.format(label))
+        return result
+
     def checklocal_pkgaudit(self):
         try:
             _data = json.loads(self._run_cache_prog("pkg audit -F --raw=json-compact -q",cachetime=360,ignore_error=True))
-            _vulns = _data.get("pkg_count",0)
+            _vulns = int(_data["pkg_count"])
             if _vulns > 0:
                 _packages = ", ".join(_data.get("packages",{}).keys())
                 return [f"1 Audit issues={_vulns} Pkg: {_packages} vulnerable"]
-            raise
-        except:
-            pass
+        except (ValueError, TypeError, KeyError):
+            return ['3 Audit - Package audit unavailable or invalid; no security result']
         return ["0 Audit issues=0 OK"]
 
     @staticmethod
     def _read_from_openvpnsocket(vpnsocket,cmd):
         _sock = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+        _sock.settimeout(5)
         try:
             _sock.connect(vpnsocket)
             assert (_sock.recv(4096).decode("utf-8")).startswith(">INFO")
@@ -784,13 +1062,13 @@ class checkmk_checker(object):
             _data = ""
             while True:
                 _socket_data = _sock.recv(4096).decode("utf-8")
+                if not _socket_data:
+                    raise ConnectionError("OpenVPN management socket closed before reply completed")
                 _data += _socket_data
                 if _data.strip().endswith("END") or _data.strip().startswith("SUCCESS:") or _data.strip().startswith("ERROR:"):
                     break
             return _data
         finally:
-            if _sock:
-                _sock.send("quit\n".encode("utf-8"))
             _sock.close()
             _sock = None
         return ""
@@ -814,14 +1092,15 @@ class checkmk_checker(object):
         _path = "/var/run/dpinger_{0}.sock".format(gateway)
         if os.path.exists(_path):
             _sock = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            _sock.settimeout(5)
             try:
                 _sock.connect(_path)
                 _data = _sock.recv(1024).decode("utf-8").strip()
                 _name, _rtt, _rttsd, _loss = re.findall(r"(\S+)\s(\d+)\s(\d+)\s(\d+)$",_data)[0]
                 assert _name.strip() == gateway
                 return int(_rtt)/1_000_000.0,int(_rttsd)/1_000_000.0, int(_loss)
-            except:
-                raise
+            finally:
+                _sock.close()
         return -1,-1,-1
 
     def checklocal_gateway(self):
@@ -860,7 +1139,7 @@ class checkmk_checker(object):
     def checklocal_openvpn(self):
         _ret = []
         _cfr = self._config_reader().get("openvpn")
-        _cfn = self._config_reader().get("OPNsense").get("OpenVPN") ##TODO new Connections
+        _cfn = (self._config_reader().get("OPNsense") or {}).get("OpenVPN")
         if type(_cfr) != dict:
             _cfr = {}
         if type(_cfn) != dict:
@@ -882,11 +1161,7 @@ class checkmk_checker(object):
         _cfn_instances = _cfn.get("Instances")
         if type(_cfn_instances) == dict:
             _cfn_instances = _cfn_instances.get("Instance")
-        for _instance in (_cfr.get("openvpn-client"),_cfr.get("openvpn-server")):
-            if type(_instance) == dict:
-                _instance = _cfn_instances.get("Instance")
-            if type(_instance) != list:
-                continue
+        for _instance in (as_list(_cfr.get("openvpn-client")),as_list(_cfr.get("openvpn-server")),as_list(_cfn_instances)):
             for _server in _instance:
                 if _server.get("disable") == '1' or _server.get("enabled") == '0':
                     continue ## FIXME OK/WARN/SKIP
@@ -897,6 +1172,8 @@ class checkmk_checker(object):
                     _server["local_port"] = _server.get("port")
                     _server["certref"] = _server.get("cert")
                     _server["socket"] = "/var/etc/openvpn/instance-{@uuid}.sock".format(**_server)
+                    if _server["type"] == "client":
+                        _server["mode"] = "p2p_tls"
                 else:
                     _server["type"] = "server" if _server.get("local_port") else "client"
                     _server["socket"] = "/var/etc/openvpn/{type}{vpnid}.sock".format(**_server)
@@ -946,7 +1223,8 @@ class checkmk_checker(object):
                         continue
                 else:
                     if not _server.get("maxclients"):
-                        _max_clients = ipaddress.IPv4Network(_server.get("tunnel_network")).num_addresses -2
+                        _network = _server.get("tunnel_network")
+                        _max_clients = ipaddress.ip_network(_network, strict=False).num_addresses - 2 if _network else 1
                         if _server.get("topology_subnet") != "yes" and _server.get("topology") != "subnet":
                             _max_clients = max(1,int(_max_clients/4)) ## p2p
                         _server["maxclients"] = _max_clients
@@ -987,12 +1265,11 @@ class checkmk_checker(object):
                         _server["clientcount"] = _number_of_clients
                         _ret.append('{status} "OpenVPN Server: {name}" connections_ssl_vpn={clientcount};;{maxclients}|if_in_octets={bytesin}|if_out_octets={bytesout}|expiredays={expiredays} {clientcount}/{maxclients} Connections Port:{local_port}/{protocol} {expiredate}'.format(**_server))
                     except:
-                        raise
                         _ret.append('2 "OpenVPN Server: {name}" connections_ssl_vpn=0;;{maxclients}|expiredays={expiredays}|if_in_octets=0|if_out_octets=0 Server down Port:{local_port}/{protocol} {expiredate}'.format(**_server))
 
         for _client in _monitored_clients.values():
             _current_conn = _client.get("current",[])
-            if _client.get("disable") == 1:
+            if str(_client.get("disable")) == "1":
                 continue
             if not _client.get("description"):
                 _client["description"] = _client.get("common_name")
@@ -1029,30 +1306,30 @@ class checkmk_checker(object):
 
     def checklocal_ipsec(self):
         _ret =[]
-        _ipsec_config = self._config_reader().get("ipsec")
-        if type(_ipsec_config) != dict:
+        _config = self._config_reader()
+        _ipsec_config = _config.get("ipsec") or {}
+        _phase1config = as_list(_ipsec_config.get("phase1")) if _ipsec_config.get("enable") == "1" else []
+        _swanctl = (_config.get("OPNsense") or {}).get("Swanctl") or {}
+        for _connection in as_list((_swanctl.get("Connections") or {}).get("Connection")):
+            if _connection.get("enabled", "1") != "0":
+                _phase1config.append(dict(_connection, descr=_connection.get("description", ""),
+                                          _connection_key=_connection.get("@uuid")))
+        if not _phase1config:
             return []
-        if _ipsec_config.get("enable") != "1":
-            return []
-        _phase1config = _ipsec_config.get("phase1")
-        _phase2config = _ipsec_config.get("phase2")
-        if type(_phase1config) != list:
-            _phase1config = [_phase1config]
-        if type(_phase2config) != list:
-            _phase2config = [_phase2config]
         _json_data = self._run_prog("/usr/local/opnsense/scripts/ipsec/list_status.py")
         if len(_json_data.strip()) > 20:
             _json_data = json.loads(_json_data)
         else:
             _json_data = {}
         for _phase1 in _phase1config:
-            if _phase1 == None:
+            if _phase1.get("disabled") == "1":
                 continue
             _ikeid = _phase1.get("ikeid")
-            _name = _phase1.get("descr")
+            _name = _phase1.get("descr") or ""
             if len(_name.strip()) < 1:
-                _name = _phase1.get("remote-gateway")
-            _condata = _json_data.get(f"con{_ikeid}",{})
+                _name = _phase1.get("remote-gateway") or _phase1.get("_connection_key") or str(_ikeid)
+            _name = re.sub(r'["\r\n]', "_", _name)
+            _condata = _json_data.get(_phase1.get("_connection_key", f"con{_ikeid}"),{})
             _con = {
                 "status"            : 2,
                 "bytes-received"    : 0,
@@ -1100,45 +1377,100 @@ class checkmk_checker(object):
                 _ret.append("{status} \"IPsec Tunnel: {remote-name}\" if_in_octets={bytes-received}|if_out_octets={bytes-sent}|lifetime={life-time} {phase2} {state} {local-id} - {remote-id}({remote-host})".format(**_con))
         return _ret
 
+    def _read_carp_states(self):
+        """Key by physical interface AND VHID; a VHID alone is not unique."""
+        states = {}
+        interface = None
+        for line in self._run_prog(["ifconfig", "-v"], timeout=5).splitlines():
+            match = re.match(r"^([\w.]+):", line)
+            if match:
+                interface = match.group(1)
+            match = re.search(r"\bcarp:\s+(MASTER|BACKUP|INIT)\s+vhid\s+(\d+)\b", line)
+            if match and interface:
+                states[(interface, match.group(2))] = match.group(1)
+        return states
+
+    def _wireguard_carp_state(self, config, dependency, states):
+        if not dependency:
+            return None
+        vips = as_list((config.get("virtualip") or {}).get("vip"))
+        matches = [vip for vip in vips if vip.get("mode") == "carp"
+                   and dependency in (vip.get("@uuid"), vip.get("subnet"))]
+        if len(matches) != 1:
+            return "UNKNOWN"
+        vip = matches[0]
+        interface = (config.get("interfaces") or {}).get(vip.get("interface"), {}).get("if")
+        return states.get((interface, str(vip.get("vhid"))), "UNKNOWN")
+
     def checklocal_wireguard(self):
-        _ret = []
-        try:
-            _clients = self._config_reader().get("OPNsense").get("wireguard").get("client").get("clients").get("client")
-            if type(_clients) != list:
-                _clients = [_clients] if _clients else []
-            _clients = dict(map(lambda x: (x.get("pubkey"),x),_clients))
-        except:
+        config = self._config_reader()
+        wg = (config.get("OPNsense") or {}).get("wireguard") or {}
+        if (wg.get("general") or {}).get("enabled") == "0":
             return []
-
-        _now = time.time()
-        for _client in _clients.values(): ## fill defaults
-            _client["interface"] = ""
-            _client["endpoint"]  = ""
-            _client["last_handshake"]  = 0
-            _client["bytes_received"]  = 0
-            _client["bytes_sent"] = 0
-            _client["status"] = 2
-
-        _dump = self._run_prog(["wg","show","all","dump"]).strip()
-        for _line in _dump.split("\n"):
-            _values = _line.split("\t")
-            if len(_values) != 9:
-                continue
-            _client = _clients.get(_values[1].strip())
-            if not _client:
-                continue
-            _client["interface"] = _values[0].strip()
-            _client["endpoint"]  = _values[3].strip().rsplit(":",1)[0]
-            _client["last_handshake"]  = int(_values[5].strip())
-            _client["bytes_received"], _client["bytes_sent"]  = self._get_traffic("wireguard",_values[0].strip(),int(_values[6].strip()),int(_values[7].strip()))
-            _client["status"] = 2 if _now - _client["last_handshake"] > 300 else 0  ## 5min timeout
-
-        for _client in _clients.values():
-            if _client.get("status") == 2 and _client.get("endpoint") != "":
-                _client["endpoint"] = "last IP:" + _client["endpoint"]
-            _ret.append('{status} "WireGuard Client: {name}" if_in_octets={bytes_received}|if_out_octets={bytes_sent} {interface}: {endpoint} - {tunneladdress}'.format(**_client))
-
-        return _ret
+        clients = {c.get("@uuid"): c for c in as_list(
+            ((wg.get("client") or {}).get("clients") or {}).get("client"))
+            if c.get("enabled", "1") != "0"}
+        servers = [s for s in as_list(((wg.get("server") or {}).get("servers") or {}).get("server"))
+                   if s.get("enabled", "1") != "0"]
+        if not servers:
+            return []
+        states = self._read_carp_states() if any(s.get("carp_depend_on") for s in servers) else {}
+        now = time.time()
+        max_age = getattr(self, "wireguard_handshake_max_age", 300)
+        grace = getattr(self, "wireguard_failover_grace", 120)
+        dump = {}
+        for line in self._run_prog(["wg", "show", "all", "dump"], timeout=5).splitlines():
+            values = line.split("\t")
+            if len(values) == 9:
+                try:
+                    dump[(values[0], values[1])] = (values[3], int(values[5]), int(values[6]), int(values[7]))
+                except ValueError:
+                    continue
+        memberships = Counter(peer for server in servers for peer in (server.get("peers") or "").split(","))
+        result = []
+        for server in servers:
+            interface = "wg{0}".format(server["instance"])
+            server_id = server.get("@uuid", interface)
+            state = self._wireguard_carp_state(config, server.get("carp_depend_on"), states)
+            previous = self._get_storedata("wireguard_carp", server_id)
+            # Retain the activation time until the next BACKUP, requiring a new
+            # handshake after failover instead of accepting one from the old MASTER.
+            activated = previous[1] if previous else None
+            if state == "BACKUP":
+                activated = None
+            elif state == "MASTER" and previous and previous[0] != "MASTER":
+                activated = int(now)
+            self._set_storedata("wireguard_carp", server_id, (state, activated))
+            for peer in (server.get("peers") or "").split(","):
+                client = clients.get(peer)
+                if not client:
+                    continue
+                name = client.get("name", peer)
+                if memberships[peer] > 1:
+                    name += " ({0})".format(server.get("name", interface))
+                name = re.sub(r'["\r\n]', "_", name)
+                endpoint, handshake, received, sent = dump.get((interface, client.get("pubkey")), ("", 0, 0, 0))
+                traffic_key = (interface, client.get("pubkey"))
+                rx, tx = self._get_traffic("wireguard", traffic_key, received, sent)
+                age = max(0, int(now - handshake)) if handshake else 0
+                fresh = handshake > 0 and age <= max_age and (activated is None or handshake >= activated)
+                if state == "BACKUP":
+                    status, detail = 0, "CARP BACKUP - tunnel intentionally inactive"
+                    # Reset traffic baseline while this instance is inactive.
+                    rx = tx = 0
+                elif state in ("UNKNOWN", "INIT"):
+                    status, detail = 3, "CARP {0} - cannot determine whether tunnel should be active".format(state)
+                elif fresh:
+                    status, detail = 0, "{0}handshake {1}s ago".format("CARP MASTER - " if state else "", age)
+                elif state == "MASTER" and activated is not None and now - activated < grace:
+                    status, detail = 1, "CARP MASTER - waiting for new handshake after failover ({0}s remaining)".format(int(grace - (now - activated)))
+                else:
+                    status = 2
+                    detail = "{0}{1}".format("CARP MASTER - " if state else "",
+                        "no new handshake after failover" if activated is not None else "missing peer or stale/missing handshake")
+                result.append('{0} "WireGuard Client: {1}" if_in_octets={2}|if_out_octets={3}|handshake_age={4} {5}: {6} {7}'.format(
+                    status, name, rx, tx, age, interface, endpoint, detail))
+        return result
 
     def checklocal_unbound(self):
         _ret = []
@@ -1174,13 +1506,14 @@ class checkmk_checker(object):
             if _certificate:
                 if type(_certificate) != dict:
                     _certificate = {}
-                _expiredays = _certificate.get("not_valid_after",_now) - _now
+                _expiredays = (_certificate.get("not_valid_after",_now) - _now) / 86400
                 _not_valid_before = _certificate.get("not_valid_before",_cert_info.get("lastUpdate"))
                 _certificate_age = _now - int(_not_valid_before if _not_valid_before else _now)
                 _cert_info["age"] = int(_certificate_age)
                 if _cert_info.get("statusCode") == "200":
-                    if _certificate_age > float(_cert_info.get("renewInterval","inf")):
-                        _cert_info["status"] = 0
+                    _cert_info["status"] = 0
+                    if _cert_info.get("autoRenewal", "1") == "1" and _certificate_age > float(_cert_info.get("renewInterval","inf")) * 86400:
+                        _cert_info["status"] = 1
                 if _expiredays < 10:
                     _cert_info["status"] = 2
                 _cert_info["issuer"] = _certificate.get("issuer")
@@ -1195,10 +1528,11 @@ class checkmk_checker(object):
         return _ret
 
     def _read_nginx_socket(self):
-        session = requests.Session()
-        session.mount("http://nginx/vts", NginxAdapter())
-        response = session.get("http://nginx/vts")
-        return response.json()
+        with requests.Session() as session:
+            session.mount("http://nginx/vts", NginxAdapter())
+            response = session.get("http://nginx/vts", timeout=5)
+            response.raise_for_status()
+            return response.json()
 
     def checklocal_nginx(self):
         _ret = []
@@ -1280,15 +1614,21 @@ class checkmk_checker(object):
         except:
             return []
         if os.path.exists(_path):
-            _sock = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-            _sock.connect(_path)
-            _sock.send("show stat\n".encode("utf-8"))
-            _data = ""
-            while True:
-                _sockdata = _sock.recv(4096)
-                if not _sockdata:
-                    break
-                _data += _sockdata.decode("utf-8")
+            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as _sock:
+                _sock.settimeout(5)
+                _sock.connect(_path)
+                _sock.sendall("show stat\n".encode("utf-8"))
+                _data = ""
+                _deadline = time.monotonic() + 5
+                while True:
+                    _remaining = _deadline - time.monotonic()
+                    if _remaining <= 0:
+                        raise TimeoutError("HAProxy response timed out")
+                    _sock.settimeout(_remaining)
+                    _sockdata = _sock.recv(4096)
+                    if not _sockdata:
+                        break
+                    _data += _sockdata.decode("utf-8")
             
             for _line in _data.split("\n"):
                 _linedata = _line.split(",")
@@ -1544,6 +1884,8 @@ class checkmk_cached_process(object):
                 _data = ""
         except subprocess.TimeoutExpired:
             _data = ""
+        except (OSError, UnicodeError):
+            _data = ""
         with self._mutex:
             self._data = (int(time.time()),_data)
             self._thread = None
@@ -1552,17 +1894,15 @@ class checkmk_cached_process(object):
         with self._mutex:
             _now = time.time()
             _mtime = self._data[0]
-        if _now - _mtime > cachetime or cachetime == 0:
-            if not self._thread:
-                if cachetime > 0:
-                    _timeout = cachetime*2-1
-                else:
-                    _timeout = None
-                with self._mutex:
+            _thread = None
+            if _now - _mtime > cachetime or cachetime == 0:
+                if self._thread is None:
+                    _timeout = cachetime*2-1 if cachetime > 0 else 60
                     self._thread = threading.Thread(target=self._runner,args=[_timeout])
-                self._thread.start()
-
-            self._thread.join(30) ## waitmax
+                    self._thread.start()
+                _thread = self._thread
+        if _thread is not None:
+            _thread.join(30) ## waitmax
         with self._mutex:
             _mtime, _data = self._data
         if not _data.strip():
@@ -1578,13 +1918,17 @@ class checkmk_server(TCPServer,checkmk_checker):
     def __init__(self,port,pidfile,onlyfrom=None,encrypt=None,skipcheck=None,expire_inventory=0,tenants=None,**kwargs):
         self.tcp_port = port
         self.pidfile = pidfile
-        self.onlyfrom = onlyfrom.split(",") if onlyfrom else None
+        self.onlyfrom = [normalize_ip(address) for address in onlyfrom.split(",")] if onlyfrom else None
         self.skipcheck = skipcheck.split(",") if skipcheck else []
         self.tenants = self._get_tenants(tenants) if type(tenants) == str else {}
         self._available_sysctl_list = self._run_prog("sysctl -aN").split()
         self._available_sysctl_temperature_list = list(filter(lambda x: x.lower().find("temperature") > -1 and x.lower().find("cpu") == -1,self._available_sysctl_list))
         self.encrypt = encrypt
-        self.expire_inventory = expire_inventory
+        self.expire_inventory = int(expire_inventory)
+        self.wireguard_handshake_max_age = int(kwargs.get("wireguard_handshake_max_age", 300))
+        self.wireguard_failover_grace = int(kwargs.get("wireguard_failover_grace", 120))
+        if self.expire_inventory < 0 or self.wireguard_handshake_max_age <= 0 or self.wireguard_failover_grace < 0:
+            raise ValueError("Invalid inventory/WireGuard timing configuration")
         self._mutex = threading.Lock()
         self.user = pwd.getpwnam("root")
         self.allow_reuse_address = True
@@ -1596,13 +1940,14 @@ class checkmk_server(TCPServer,checkmk_checker):
         for _tenant in tenants.split(","):
             if _tenant.find("#") > -1:
                 _addr,_secret = _tenant.split("#",1)
-                _ret[_addr] = _secret
+                _ret[normalize_ip(_addr)] = _secret
             else:
-                _ret[_addr] = None
+                _ret[normalize_ip(_addr)] = None
         return _ret
 
     def verify_request(self, request, client_address):
-        if self.onlyfrom and client_address[0] not in self.onlyfrom and client_address[0] not in self.tenants.keys():
+        address = normalize_ip(client_address[0])
+        if self.onlyfrom and address not in self.onlyfrom and address not in self.tenants.keys():
             log("Client {0} not allowed".format(*client_address),"warn")
             return False
         return True
@@ -1640,7 +1985,7 @@ class checkmk_server(TCPServer,checkmk_checker):
         _sock.settimeout(3)
         try:
             _sock.connect((checkoutput,port))
-            _sock.settimeout(None)
+            _sock.settimeout(30)
             _msg = b""
             while True:
                 _data = _sock.recv(2048)
@@ -1821,6 +2166,8 @@ class checkmk_task(object):
         _tenant = config.get("tenant")
         self.tenant = _tenant.split(",") if type(_tenant) == str else []
         self.interval = int(config.get("interval","3600"))
+        if self.interval <= 0:
+            raise ValueError("Task interval must be positive")
         self.nextrun = time.time()
         self.error = None
         self._data = ""
@@ -1834,7 +2181,10 @@ class checkmk_task(object):
     def update(self,config):
         with self._mutex:
             self.interval = int(config.get("interval","3600"))
-            self.piggyback = config.get("piggyback")
+            if self.interval <= 0:
+                raise ValueError("Task interval must be positive")
+            self.type = config.get("type")
+            self.piggyback = config.get("piggyback", "")
             _tenant = config.get("tenant")
             self.tenant =  _tenant.split(",") if type(_tenant) == str else []
             self.config = config
@@ -1860,8 +2210,14 @@ class checkmk_task(object):
             _function = getattr(self,f"_{self.type}")
             if _function:
                 _data = _function()
+                if not isinstance(_data, str):
+                    raise ValueError("Task returned no agent output: {0}".format(self.type))
                 with self._mutex:
                     self._data = _data
+        except Exception as error:
+            with self._mutex:
+                self.error = str(error)
+                self._data = ""
         finally:
             with self._mutex:
                 self._thread = None
@@ -2146,7 +2502,7 @@ class checkmk_taskrunner(object):
             if _piggyback != "":
                 _data += ["<<<<>>>>"]
 
-        _task_service = "{0} 'CMK Tasks' tasks={1}|tasks_running={2},tasks_failed={3} OK".format(0 if _fails == 0 else 1,_task_count,_task_running_count,_fails)
+        _task_service = '{0} "CMK Tasks" tasks={1}|tasks_running={2}|tasks_failed={3} {4}'.format(0 if _fails == 0 else 1,_task_count,_task_running_count,_fails,"OK" if _fails == 0 else "Task failures")
         return [_task_service] + _data
 
     def check_taskdir(self):
@@ -2155,13 +2511,15 @@ class checkmk_taskrunner(object):
             _id = os.path.basename(_file)
             _task = list(filter(lambda x: x.id == _id,self._queue))
             if _task:
-                if _task[0].lastmodified < os.stat(_file).st_mtime:
+                if _task[0].lastmodified == os.stat(_file).st_mtime:
                     sys.stderr.write(f"{_id} not modified\n")
                     sys.stderr.flush()
                     _ids.append(_id)
                     continue
             with open(_file,"r",encoding="utf-8") as _f:
                 _options = dict(TASKFILE_REGEX.findall(_f.read()))
+            if _options.get("disabled", "0").lower() in ("1", "true", "yes"):
+                continue
             _type = _options.get("type","").strip()
             if _type not in ("nmap","speedtest","proxy","ssh","domain","blocklist","cmk","dummy"):
                 sys.stderr.write(f"unknown {_type}\n")
@@ -2173,12 +2531,11 @@ class checkmk_taskrunner(object):
             else:
                 _task = checkmk_task(_id,_options)
                 self._queue.append(_task)
+            next(task for task in self._queue if task.id == _id).lastmodified = os.stat(_file).st_mtime
             _ids.append(_id)
 
         # remove old tasks
-        for _task in self._queue:
-            if _task.id not in _ids:
-                self._queue.remove(_task)
+        self._queue = [task for task in self._queue if task.id in _ids]
         #self._queue = list(filter(lambda x: x.id in _ids,self._queue)) ## remove config if file removed or disabled 
         #pprint(self._queue)
 
@@ -2187,7 +2544,6 @@ class checkmk_taskrunner(object):
 
     def _run_forever(self):
         _check = 0
-        PREEXEC = 120
         while self.isrunning:
             try:
                 _now = time.time()
@@ -2201,12 +2557,12 @@ class checkmk_taskrunner(object):
                 with self._mutex:
                     if self._queue:
                         self._queue.sort()
-                        next_task = self._queue[0]
+                        next_task = next((task for task in self._queue if task._thread is None), None)
 
                 if next_task:
                     sys.stderr.write(f"next: {next_task.id} {next_task!r}\n")
                     sys.stderr.flush()
-                    wait_time = max(0, next_task.nextrun - _now - PREEXEC)
+                    wait_time = max(0, next_task.nextrun - _now)
                     if wait_time > 0:
                         self._event.wait(min(30, wait_time))
                         self._event.clear()
@@ -2217,8 +2573,10 @@ class checkmk_taskrunner(object):
                     self._event.clear()
 
             except Exception as err:
+                self.err = str(err)
                 sys.stderr.write(str(err) + "\n")
                 sys.stderr.flush()
+                self._event.wait(3)
 
     def _run_task(self, task):
         running_tasks = self._get_running_task_threads()
@@ -2411,7 +2769,9 @@ if __name__ == "__main__":
             if _k == "onlyfrom":
                 args.onlyfrom = _v
             if _k == "expire_inventory":
-                args.expire_inventory = _v
+                args.expire_inventory = int(_v)
+            if _k in ("wireguard_handshake_max_age", "wireguard_failover_grace"):
+                setattr(args, _k, int(_v))
             if _k == "skipcheck":
                 args.skipcheck = _v
             if _k == "tenants":
@@ -2468,7 +2828,8 @@ if __name__ == "__main__":
                 sys.exit(1)
         try:
             print("stopping")
-            os.kill(_pid,signal.SIGTERM)
+            if _pid > 0:
+                os.kill(_pid,signal.SIGTERM)
         except ProcessLookupError:
             if os.path.exists(args.pidfile):
                 os.remove(args.pidfile)
@@ -2503,11 +2864,13 @@ if __name__ == "__main__":
         import hashlib
         import difflib
         from packaging.version import Version
-        _github_req = requests.get(f"https://api.github.com/repos/bashclub/check-opnsense/contents/opnsense_checkmk_agent.py?ref={args.update}")
+        _github_req = requests.get("https://api.github.com/repos/bashclub/checkmk-opnsense-agent/contents/opnsense_checkmk_agent.py", params={"ref": args.update}, timeout=15)
         if _github_req.status_code != 200:
             raise Exception(f"Github Error {_github_req.status_code}")
         _github_version = _github_req.json()
-        _github_last_modified = datetime.strptime(_github_req.headers.get("last-modified"),"%a, %d %b %Y %X %Z")
+        from email.utils import parsedate_to_datetime
+        _modified_header = _github_req.headers.get("last-modified")
+        _github_last_modified = parsedate_to_datetime(_modified_header) if _modified_header else datetime.now()
         _new_script = base64.b64decode(_github_version.get("content")).decode("utf-8")
         _new_version = re.findall(r"^__VERSION__.*?\"([0-9.]*)\"",_new_script,re.M)
         _new_version = _new_version[0] if _new_version else "0.0.0"
@@ -2534,8 +2897,7 @@ if __name__ == "__main__":
                 print("")
                 sys.exit(0)
             if _answer in ("Y","y","yes","j","J"):
-                with open(_script_location,"wb") as _f:
-                    _f.write(_new_script.encode("utf-8"))
+                replace_agent(_script_location, _new_script)
                 
                 print(f"updated to Version {_new_version}")
                 if _pid > 0:
@@ -2552,7 +2914,7 @@ if __name__ == "__main__":
                             print("waiting")
                             time.sleep(5)
                             print("restart")
-                            os.system(f"{_script_location} --start")
+                            subprocess.check_call([sys.executable, _script_location, "--start", "--config", args.configfile])
                             sys.exit(0)
                     except OSError:
                         pass
@@ -2576,7 +2938,7 @@ if __name__ == "__main__":
         print(f"Version: {__VERSION__}")
         print("#"*35)
         print("")
-        print("Latest Version under https://github.com/bashclub/check-opnsense")
+        print("Latest Version under https://github.com/bashclub/checkmk-opnsense-agent")
         print("Questions under https://forum.opnsense.org/index.php?topic=26594.0\n")
         print("Server-side implementation for")
         print("-"*35)
@@ -2596,7 +2958,7 @@ if __name__ == "__main__":
         for _opt in ("port","encrypt","onlyfrom","skipcheck","tenants"):
             _val = getattr(args,_opt,None)
             if _val:
-                print(f"{_opt}: {_val}")
+                print(f"{_opt}: {'[redacted]' if _opt in ('encrypt', 'tenants') else _val}")
         print("\n")
         print("the following tasks are found")
         try:
