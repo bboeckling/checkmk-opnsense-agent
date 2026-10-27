@@ -32,7 +32,7 @@
 ##
 
 
-__VERSION__ = "1.2.19"
+__VERSION__ = "1.2.20"
 
 import sys
 import os
@@ -616,7 +616,8 @@ class checkmk_checker(object):
         return peers
 
     def checklocal_bgp(self):
-        routing = (self._config_reader().get("OPNsense") or {}).get("quagga") or {}
+        config = self._config_reader()
+        routing = (config.get("OPNsense") or {}).get("quagga") or {}
         general = routing.get("general") or {}
         bgp = routing.get("bgp") or {}
         if general.get("enabled") != "1" or bgp.get("enabled") != "1":
@@ -641,9 +642,27 @@ class checkmk_checker(object):
                 if family_name:
                     expected[("default", family_name, address)] = neighbor
         previous = self._get_storedata("bgp", "peers") or {}
+        carp = self._frr_carp_state(config)
+        previous_role = self._get_storedata("bgp_carp", "role")
+        activated = previous_role[1] if previous_role and previous_role[0] == "MASTER" else None
+        if carp == "MASTER" and previous_role and previous_role[0] != "MASTER":
+            activated = time.time()
+        if carp != "MASTER":
+            activated = None
+        self._set_storedata("bgp_carp", "role", (carp, activated))
+        grace = getattr(self, "bgp_failover_grace", 120)
+        starting = carp == "MASTER" and activated is not None and time.time() - activated < grace
+        if carp in ("BACKUP", "UNKNOWN", "MIXED", "INIT"):
+            status = 0 if carp == "BACKUP" else 3
+            detail = "CARP BACKUP - FRR intentionally inactive" if carp == "BACKUP" else "CARP {0} - FRR expected state cannot be determined".format(carp)
+            monitored = set(expected) | {key for key in previous if key[0] != "default" or key[2] not in disabled}
+            result = ['{0} "BGP FRR" sessions={1} {2}'.format(status, len(monitored), detail)]
+            for vrf, family, address in sorted(monitored):
+                name = re.sub(r'["\r\n]', "_", "BGP {0} {1} {2}".format(vrf, family, address))
+                result.append('{0} "{1}" - {2}'.format(status, name, detail))
+            return result
         error_status = None
         try:
-            # Deliberately independent of CARP: both routers may run BGP.
             output = subprocess.check_output(["/usr/local/bin/vtysh", "-c", "show bgp vrf all summary json"],
                 encoding="utf-8", stderr=subprocess.DEVNULL, timeout=5)
             peers = self._bgp_summary_peers(json.loads(output))
@@ -651,6 +670,8 @@ class checkmk_checker(object):
             peers, error_status, error_detail = {}, 2, "FRR BGP query failed or vtysh unavailable"
         except (OSError, ValueError, subprocess.TimeoutExpired):
             peers, error_status, error_detail = {}, 3, "FRR BGP summary unavailable or invalid"
+        if error_status is not None and starting:
+            error_status, error_detail = 1, "CARP MASTER - waiting for FRR after failover"
         if error_status is None:
             peers = {key: peer for key, peer in peers.items() if key[0] != "default" or key[2] not in disabled}
             monitored = set(peers) | set(expected)
@@ -667,12 +688,12 @@ class checkmk_checker(object):
             if error_status is not None:
                 status, detail = error_status, error_detail
             elif peer is None:
-                status, detail = 2, "Configured neighbor missing from FRR summary"
+                status, detail = (1, "CARP MASTER - waiting for neighbor after failover") if starting else (2, "Configured neighbor missing from FRR summary")
                 metrics.append("established=0")
             else:
                 up = peer["state"] == "Established"
                 established += int(up)
-                status = 0 if up else 2
+                status = 0 if up else 1 if starting else 2
                 policy = peer.get("peerState") == "Policy" or any(peer.get(field) == "(Policy)" for field in ("pfxRcd", "pfxSnt"))
                 if policy:
                     status = max(status, 1)
@@ -710,6 +731,7 @@ class checkmk_checker(object):
 
     def check_net(self):
         _now = int(time.time())
+        _carp_wg = self._wireguard_carp_servers(self._config_reader())
         _opnsense_ifs = self.get_opnsense_interfaces()
         _ret = ["<<<statgrab_net>>>"]
         _interface_data = []
@@ -813,13 +835,15 @@ class checkmk_checker(object):
                         pass
 
             _flags = _interface_dict.get("flags")
-            if _flags and (_flags & 0x2 or _flags & 0x10 or _flags & 0x80): ## nur broadcast oder ptp .. und noarp
+            if _interface.startswith("wg"):
+                _interface_dict["up"] = "true" if (_flags or 0) & 0x1 else "false"
+            if _interface in _carp_wg or _flags and (_flags & 0x2 or _flags & 0x10 or _flags & 0x80): ## nur broadcast oder ptp .. und noarp
                 self._all_interfaces[_interface] = _interface_dict
             else:
                 continue
             #if re.search("^[*]?(pflog|pfsync|lo)\d?",_interface):
             #    continue
-            if not _opnsense_ifs.get(_interface):
+            if not _opnsense_ifs.get(_interface) or _interface in _carp_wg:
                 continue
             for _key,_val in _interface_dict.items():
                 if _key in ("mtu","ipackets","ierrors","idrop","rx","opackets","oerrors","tx","collisions","drop","interface_name","up","systime","phys_address","speed","duplex"):
@@ -840,7 +864,21 @@ class checkmk_checker(object):
             return ['3 Services - Service status query timed out']
         _services = []
         for _service in _data.strip().split("\n"):
-            _services.append(_service.split(";"))
+            _fields = _service.split(";")
+            if len(_fields) != 3:
+                return ['3 Services - Invalid service status response']
+            _services.append(_fields)
+        _standby = []
+        _starting = []
+        if any(service[0] == "frr" and service[2] != "1" for service in _services):
+            _role = self._frr_carp_state(self._config_reader())
+            _transition = self._get_storedata("bgp_carp", "role")
+            _frr = [service for service in _services if service[0] == "frr" and service[2] != "1"]
+            if _role == "BACKUP":
+                _standby = _frr
+            elif _role == "MASTER" and _transition and _transition[0] == "MASTER" and _transition[1] is not None and time.time() - _transition[1] < getattr(self, "bgp_failover_grace", 120):
+                _starting = _frr
+            _services = [service for service in _services if service not in _standby + _starting]
         _num_services = len(_services)
         _stopped_services = list(filter(lambda x: x[2] != '1',_services))
         _num_stopped = len(_stopped_services)
@@ -848,7 +886,10 @@ class checkmk_checker(object):
         _stopped_services = ", ".join(map(lambda x: x[1],_stopped_services))
         if _num_stopped > 0:
             return [f"2 Services running_services={_num_running:.0f}|stopped_service={_num_stopped:.0f} Services: {_stopped_services} not running"]
-        return [f"0 Services running_services={_num_running:.0f}|stopped_service={_num_stopped:.0f} All Services running"]
+        _detail = "All required services running" + ("; FRR intentionally inactive (CARP BACKUP)" if _standby else "")
+        if _starting:
+            _detail = "CARP MASTER - waiting for FRR after failover"
+        return [f"{1 if _starting else 0} Services running_services={_num_running:.0f}|stopped_service={_num_stopped:.0f} {_detail}"]
 
     def checklocal_carpstatus(self):
         _ret = []
@@ -1557,7 +1598,7 @@ class checkmk_checker(object):
                 states[(interface, match.group(2))] = match.group(1)
         return states
 
-    def _wireguard_carp_state(self, config, dependency, states):
+    def _carp_dependency_state(self, config, dependency, states):
         if not dependency:
             return None
         vips = as_list((config.get("virtualip") or {}).get("vip"))
@@ -1568,6 +1609,73 @@ class checkmk_checker(object):
         vip = matches[0]
         interface = (config.get("interfaces") or {}).get(vip.get("interface"), {}).get("if")
         return states.get((interface, str(vip.get("vhid"))), "UNKNOWN")
+
+    def _frr_carp_state(self, config):
+        general = (((config.get("OPNsense") or {}).get("quagga") or {}).get("general") or {})
+        dependency = getattr(self, "bgp_carp_depend_on", "auto")
+        if dependency == "off" or dependency == "auto" and general.get("enablecarp") != "1":
+            return None
+        states = self._read_carp_states()
+        if dependency not in ("auto", "all"):
+            return self._carp_dependency_state(config, dependency, states)
+        roles = []
+        for vip in as_list((config.get("virtualip") or {}).get("vip")):
+            if vip.get("mode") == "carp":
+                interface = (config.get("interfaces") or {}).get(vip.get("interface"), {}).get("if")
+                roles.append(states.get((interface, str(vip.get("vhid"))), "UNKNOWN"))
+        if not roles or any(role not in ("MASTER", "BACKUP") for role in roles):
+            return "UNKNOWN"
+        return roles[0] if len(set(roles)) == 1 else "MIXED"
+
+    @staticmethod
+    def _wireguard_carp_servers(config):
+        wg = (config.get("OPNsense") or {}).get("wireguard") or {}
+        if (wg.get("general") or {}).get("enabled") == "0":
+            return {}
+        return {"wg{0}".format(server["instance"]): server for server in
+                as_list(((wg.get("server") or {}).get("servers") or {}).get("server"))
+                if server.get("enabled", "1") != "0" and server.get("carp_depend_on")}
+
+    def checklocal_wireguard_interfaces(self):
+        config = self._config_reader()
+        servers = self._wireguard_carp_servers(config)
+        if not servers:
+            return []
+        states = self._read_carp_states()
+        result = []
+        now = time.time()
+        for interface, server in sorted(servers.items()):
+            carp = self._carp_dependency_state(config, server["carp_depend_on"], states)
+            info = getattr(self, "_all_interfaces", {}).get(interface)
+            if info is None:
+                output = self._run_prog(["ifconfig", interface], timeout=5)
+                match = re.search(r"^" + re.escape(interface) + r":\s+flags=([0-9a-f]+)", output, re.M)
+                info = {"flags": int(match.group(1), 16)} if match else {}
+            up = bool(info.get("flags", 0) & 0x1)
+            previous = self._get_storedata("wireguard_interface_carp", interface)
+            activated = previous[1] if previous and previous[0] == "MASTER" else None
+            if carp == "MASTER" and previous and previous[0] != "MASTER":
+                activated = now
+            if carp != "MASTER":
+                activated = None
+            self._set_storedata("wireguard_interface_carp", interface, (carp, activated))
+            if carp == "BACKUP":
+                status, detail = 0, "CARP BACKUP - interface intentionally inactive"
+            elif carp != "MASTER":
+                status, detail = 3, "CARP {0} - expected interface state unknown".format(carp)
+            elif up:
+                status, detail = 0, "CARP MASTER - interface up"
+            elif activated is not None and now - activated < getattr(self, "wireguard_failover_grace", 120):
+                status, detail = 1, "CARP MASTER - waiting for interface after failover"
+            else:
+                status, detail = 2, "CARP MASTER - interface down or missing"
+            metrics = ["interface_up={0}".format(int(up))]
+            if "rx" in info and "tx" in info:
+                rx, tx = self._get_traffic("wireguard_interface", interface, int(info["rx"]), int(info["tx"]))
+                metrics.extend(("if_in_octets={0}".format(rx), "if_out_octets={0}".format(tx)))
+            name = re.sub(r'["\r\n]', "_", "WireGuard Interface: {0} ({1})".format(server.get("name") or interface, interface))
+            result.append('{0} "{1}" {2} {3}'.format(status, name, "|".join(metrics), detail))
+        return result
 
     def checklocal_wireguard(self):
         config = self._config_reader()
@@ -1598,7 +1706,7 @@ class checkmk_checker(object):
         for server in servers:
             interface = "wg{0}".format(server["instance"])
             server_id = server.get("@uuid", interface)
-            state = self._wireguard_carp_state(config, server.get("carp_depend_on"), states)
+            state = self._carp_dependency_state(config, server.get("carp_depend_on"), states)
             previous = self._get_storedata("wireguard_carp", server_id)
             # Retain the activation time until the next BACKUP, requiring a new
             # handshake after failover instead of accepting one from the old MASTER.
@@ -2094,7 +2202,9 @@ class checkmk_server(TCPServer,checkmk_checker):
         self.expire_inventory = int(expire_inventory)
         self.wireguard_handshake_max_age = int(kwargs.get("wireguard_handshake_max_age", 300))
         self.wireguard_failover_grace = int(kwargs.get("wireguard_failover_grace", 120))
-        if self.expire_inventory < 0 or self.wireguard_handshake_max_age <= 0 or self.wireguard_failover_grace < 0:
+        self.bgp_carp_depend_on = kwargs.get("bgp_carp_depend_on", "auto").strip()
+        self.bgp_failover_grace = int(kwargs.get("bgp_failover_grace", 120))
+        if self.expire_inventory < 0 or self.wireguard_handshake_max_age <= 0 or self.wireguard_failover_grace < 0 or self.bgp_failover_grace < 0:
             raise ValueError("Invalid inventory/WireGuard timing configuration")
         self._mutex = threading.Lock()
         self.user = pwd.getpwnam("root")
@@ -2937,8 +3047,10 @@ if __name__ == "__main__":
                 args.onlyfrom = _v
             if _k == "expire_inventory":
                 args.expire_inventory = int(_v)
-            if _k in ("wireguard_handshake_max_age", "wireguard_failover_grace"):
+            if _k in ("wireguard_handshake_max_age", "wireguard_failover_grace", "bgp_failover_grace"):
                 setattr(args, _k, int(_v))
+            if _k == "bgp_carp_depend_on":
+                args.bgp_carp_depend_on = _v
             if _k == "skipcheck":
                 args.skipcheck = _v
             if _k == "tenants":

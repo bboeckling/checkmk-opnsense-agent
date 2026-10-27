@@ -28,11 +28,30 @@ The original installation steps are retained; the download URL points to this fo
 **Added or improved in this fork:**
 
 - **Kea DHCPv4/v6:** service and HA status, address/prefix pool utilization (WARN 80%, CRIT 90%), excluding reservations outside the pools. Missing or inconsistent counters trigger a bounded, paged lease lookup; failed lookups produce UNKNOWN.
-- **FRR BGP:** neighbor state, prefix counters and policy warnings, checked independently on both firewalls.
-- **WireGuard with CARP:** intentional standby is OK; takeover requires a new handshake after a configurable grace period (default 120 seconds). Traffic counters are separated per peer.
+- **FRR BGP:** neighbor state, prefix counters and policy warnings; automatically respects FRR's CARP failover setting. Intentional standby is OK; takeover has a configurable grace period.
+- **WireGuard with CARP:** peers and interfaces recognize intentional standby; takeover requires an active interface and a new handshake. Traffic counters are separated per peer/interface.
 - **Compatibility and reliability:** OpenVPN instances, IPsec Connections, and fixes for inventory, audit results, tasks, certificates, timeouts, restarts and updates.
 
 The built-in `--update` still downloads upstream code and can overwrite these additions.
+
+## CARP-aware monitoring
+
+FRR uses the OPNsense plugin's CARP setting automatically. With that setting off,
+BGP remains monitored on both nodes. Mixed or unknown CARP roles produce UNKNOWN.
+For a custom script that stops FRR on standby, declare its dependency in
+`/usr/local/etc/checkmk.conf`: `bgp_carp_depend_on: all` (all CARP VIPs), or a
+specific VIP address/UUID. `off` explicitly disables this behavior.
+`bgp_failover_grace` and `wireguard_failover_grace` default to 120 seconds, starting
+when the running agent observes takeover; failures during startup produce WARN.
+
+CARP-dependent WireGuard interfaces now have local services named
+`WireGuard Interface: <name> (wgN)` instead of standard interface services.
+After updating, run Checkmk service discovery, accept the replacements, and
+remove the vanished old services. Review other interface assignments during
+discovery because statgrab interface indexes can shift. The new services record
+their own traffic history; the actual interface state remains visible even on
+BACKUP. WireGuard instances without CARP dependencies keep their standard checks.
+These checks only observe status and do not start/stop FRR or change interfaces.
 
 ## Disclaimer
 

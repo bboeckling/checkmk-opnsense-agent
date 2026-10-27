@@ -155,6 +155,69 @@ class WireGuardTests(unittest.TestCase):
         self.assertEqual([("wg0", "key-a"), ("wg0", "key-b")], keys)
 
 
+class WireGuardInterfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.config = wg_config()
+        self.config["interfaces"]["wan"]["enable"] = "1"
+        self.obj = checker(self.config)
+        self.carp = "BACKUP"
+        self.up = False
+        self.missing = False
+        self.obj._run_prog = self.run_prog
+
+    def run_prog(self, command, **kwargs):
+        if isinstance(command, str) and command.startswith("/usr/bin/netstat"):
+            return "Name Ibytes Obytes Ipkts Opkts Ierrs Oerrs\nwg0 1000 2000 10 20 0 0\nigb0 3000 4000 30 40 0 0\n"
+        physical = 'igb0: flags=8843<UP,BROADCAST,RUNNING>\n\tstatus: active\n\tcarp: {0} vhid 1 advbase 1 advskew 100\n'.format(self.carp)
+        wg = '' if self.missing else 'wg0: flags={0}<RUNNING,NOARP,MULTICAST>\n\tgroups: wireguard\n'.format("80c1" if self.up else "80c0")
+        return physical + wg
+
+    def output(self):
+        self.obj.check_net()
+        return self.obj.checklocal_wireguard_interfaces()[0]
+
+    def test_backup_interface_is_truthfully_down_but_ok(self):
+        output = self.output()
+        self.assertTrue(output.startswith('0 "WireGuard Interface: VPN (wg0)"'))
+        self.assertIn("interface_up=0", output)
+        self.assertIn("intentionally inactive", output)
+        self.assertEqual("false", self.obj._all_interfaces["wg0"]["up"])
+
+    def test_only_carp_wireguard_is_replaced_in_standard_interface_section(self):
+        output = self.obj.check_net()
+        self.assertFalse(any(line.startswith("wg0.") for line in output))
+        self.assertTrue(any(line.startswith("igb0.") for line in output))
+        self.config["OPNsense"]["wireguard"]["server"]["servers"]["server"]["carp_depend_on"] = ""
+        self.assertIn("wg0.up false", self.obj.check_net())
+        self.assertEqual([], self.obj.checklocal_wireguard_interfaces())
+
+    def test_master_down_and_up(self):
+        self.carp = "MASTER"
+        self.assertTrue(self.output().startswith("2 "))
+        self.up = True
+        self.assertTrue(self.output().startswith("0 "))
+        self.assertIn("interface_up=1", self.output())
+
+    def test_missing_interface_is_ok_only_on_backup(self):
+        self.missing = True
+        self.assertTrue(self.output().startswith("0 "))
+        self.carp = "MASTER"
+        with patch.object(time, "time", return_value=1000):
+            self.assertTrue(self.output().startswith("1 "))
+        with patch.object(time, "time", return_value=1121):
+            self.assertTrue(self.output().startswith("2 "))
+
+    def test_init_and_unresolved_vip_are_unknown(self):
+        self.carp = "INIT"
+        self.assertTrue(self.output().startswith("3 "))
+        self.config["virtualip"]["vip"]["@uuid"] = "missing"
+        self.assertTrue(self.output().startswith("3 "))
+
+    def test_master_interface_read_without_net_section(self):
+        self.carp, self.up = "MASTER", True
+        self.assertTrue(self.obj.checklocal_wireguard_interfaces()[0].startswith("0 "))
+
+
 class KeaTests(unittest.TestCase):
     def setUp(self):
         self.config = {"OPNsense": {"Kea": {"dhcp4": {"general": {"enabled": "1"}}}}}
@@ -431,6 +494,105 @@ class BGPTests(unittest.TestCase):
 
     def output(self):
         return self.obj.checklocal_bgp()
+
+    def enable_carp(self, state="BACKUP"):
+        config = wg_config()
+        self.config.update(interfaces=config["interfaces"], virtualip=config["virtualip"])
+        self.config["OPNsense"]["quagga"]["general"]["enablecarp"] = "1"
+        self.obj._read_carp_states = Mock(return_value={("igb0", "1"): state})
+
+    def test_carp_enabled_backup_is_ok_without_querying_stopped_frr(self):
+        self.enable_carp()
+        self.run_command.side_effect = FileNotFoundError
+        output = self.output()
+        self.assertTrue(all(line.startswith("0 ") for line in output))
+        self.assertIn("FRR intentionally inactive", output[0])
+        self.assertIn('"BGP default ipv4Unicast 192.0.2.2"', output[1])
+        self.run_command.assert_not_called()
+
+    def test_carp_master_with_failed_frr_is_critical(self):
+        self.enable_carp("MASTER")
+        self.run_command.side_effect = subprocess.CalledProcessError(1, "vtysh")
+        self.assertTrue(all(line.startswith("2 ") for line in self.output()))
+
+    def test_bgp_failover_grace_then_normal_monitoring(self):
+        self.enable_carp()
+        self.output()
+        self.obj._read_carp_states.return_value = {("igb0", "1"): "MASTER"}
+        self.run_command.side_effect = subprocess.CalledProcessError(1, "vtysh")
+        with patch.object(time, "time", return_value=1000):
+            self.assertTrue(all(line.startswith("1 ") for line in self.output()))
+        with patch.object(time, "time", return_value=1121):
+            self.assertTrue(all(line.startswith("2 ") for line in self.output()))
+        self.run_command.side_effect = lambda *args, **kwargs: json.dumps(self.summary)
+        self.assertTrue(all(line.startswith("0 ") for line in self.output()))
+
+    def test_non_established_peer_warns_during_failover_then_critical(self):
+        self.enable_carp()
+        self.output()
+        self.obj._read_carp_states.return_value = {("igb0", "1"): "MASTER"}
+        self.peer["state"] = "Active"
+        with patch.object(time, "time", return_value=1000):
+            self.assertTrue(self.output()[1].startswith("1 "))
+        with patch.object(time, "time", return_value=1121):
+            self.assertTrue(self.output()[1].startswith("2 "))
+
+    def test_mixed_carp_roles_do_not_hide_outage(self):
+        self.enable_carp()
+        vip = self.config["virtualip"]["vip"]
+        self.config["virtualip"]["vip"] = [vip, dict(vip, interface="lan")]
+        self.obj._read_carp_states.return_value = {("igb0", "1"): "BACKUP", ("igb1", "1"): "MASTER"}
+        self.assertTrue(self.output()[0].startswith("3 "))
+        self.assertIn("MIXED", self.output()[0])
+
+    def test_missing_carp_status_is_unknown(self):
+        self.enable_carp()
+        self.obj._read_carp_states.return_value = {}
+        self.assertTrue(all(line.startswith("3 ") for line in self.output()))
+
+    def test_custom_script_carp_dependency_can_be_declared(self):
+        self.enable_carp()
+        self.config["OPNsense"]["quagga"]["general"]["enablecarp"] = "0"
+        self.obj.bgp_carp_depend_on = "vip-wan"
+        self.assertTrue(self.output()[0].startswith("0 "))
+        self.assertIn("intentionally inactive", self.output()[0])
+        self.run_command.assert_not_called()
+
+    def test_carp_override_off_does_not_suppress_failures(self):
+        self.enable_carp()
+        self.obj.bgp_carp_depend_on = "off"
+        self.peer["state"] = "Idle"
+        self.assertTrue(self.output()[1].startswith("2 "))
+
+    def test_services_ignore_only_intentionally_stopped_frr(self):
+        self.enable_carp()
+        process = Mock()
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;1\n", "")
+        with patch.object(subprocess, "Popen", return_value=process):
+            output = self.obj.checklocal_services()[0]
+        self.assertTrue(output.startswith("0 "))
+        self.assertIn("FRR intentionally inactive", output)
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;0\n", "")
+        with patch.object(subprocess, "Popen", return_value=process):
+            self.assertTrue(self.obj.checklocal_services()[0].startswith("2 "))
+
+    def test_services_respect_frr_startup_grace_but_not_other_failures(self):
+        self.enable_carp("MASTER")
+        self.obj._set_storedata("bgp_carp", "role", ("MASTER", 1000))
+        process = Mock()
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;1\n", "")
+        with patch.object(subprocess, "Popen", return_value=process), patch.object(time, "time", return_value=1010):
+            self.assertTrue(self.obj.checklocal_services()[0].startswith("1 "))
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;0\n", "")
+        with patch.object(subprocess, "Popen", return_value=process), patch.object(time, "time", return_value=1010):
+            self.assertTrue(self.obj.checklocal_services()[0].startswith("2 "))
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;1\n", "")
+        with patch.object(subprocess, "Popen", return_value=process), patch.object(time, "time", return_value=1121):
+            self.assertTrue(self.obj.checklocal_services()[0].startswith("2 "))
+        self.obj._read_carp_states.return_value = {("igb0", "1"): "MASTER"}
+        process.communicate.return_value = ("frr;FRRouting Daemon;0\nunbound;Unbound;1\n", "")
+        with patch.object(subprocess, "Popen", return_value=process):
+            self.assertTrue(self.obj.checklocal_services()[0].startswith("2 "))
 
     def test_established_session_and_metrics(self):
         output = self.output()
